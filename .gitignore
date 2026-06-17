@@ -1,27 +1,29 @@
-# Dependencies
-node_modules/
-vendor/
-
-# Build outputs
-dist/
-build/
-*.exe
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
+# 运行时数据与日志
+*.db
+*.db-journal
 *.log
-npm-debug.log*
+worktrace_start.log
+daily_report.txt
 
-# Environment variables
-.env
-.env.local
-.env.*.local
+# 自动生成的复盘报告
+worktrace_review_*.html
+dashboard.html
+
+# 本地配置（含窗口位置等本地状态，按需提交）
+config.json
+
+# 临时与历史脚本
+_new_panel.py
+_windows_new.py
+design_compare.html
+design_compare_d.html
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统
+Thumbs.db
+.DS_Store
+启动时间追踪.bat
