@@ -29,6 +29,8 @@ import threading
 import ctypes
 import struct
 import html
+import re
+import urllib.request
 from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict
@@ -75,8 +77,14 @@ DEFAULT_CONFIG = {
     "no_input_threshold": 180,      # 实际无操作判定阈值（秒）
     "window_x": -1,                 # 窗口位置 X（-1 表示自动）
     "window_y": -1,                 # 窗口位置 Y
-    "always_on_top": True,          # 窗口置顶
-    "theme": "dark"                 # 主题：dark / light
+    "edge_hide": False,             # 吸边隐藏：拖到屏幕左右边缘自动隐藏成露出条，移到露出条唤出
+    "theme": "dark",                # 主题：dark / light
+    # AI 内容感知偏离判定
+    "ai_enabled": True,             # 是否启用 AI 内容判定（关闭则退回进程名兜底）
+    "body_send": True,              # 是否把正文摘要外发给 AI（关闭则只发标题+网址）
+    "ark_api_key": "",              # 火山方舟 API Key —— 留空，真实 key 写入本地 config.json（已 gitignore）
+    "ark_endpoint": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    "ark_model": "ep-20260604101325-f2wcq"
 }
 
 # ========== Cyberpunk 主题色板 ==========
@@ -162,6 +170,29 @@ def save_config(cfg):
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
+def _apply_auto_launch(enabled):
+    """设置/取消开机自启（仅在 auto_launch 改变时调用，避免每次保存都写注册表）。"""
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "TimeTracker"
+        script_path = os.path.join(SCRIPT_DIR, "time_tracker_v2.py")
+        pythonw_path = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(pythonw_path):
+            pythonw_path = sys.executable
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+        if enabled:
+            launch_cmd = f'"{pythonw_path}" "{script_path}"'
+            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, launch_cmd)
+        else:
+            try:
+                winreg.DeleteValue(key, app_name)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception as e:
+        print(f"[开机自启动] 设置失败: {e}")
+
 # 全局配置
 config = load_config()
 
@@ -182,6 +213,168 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+# UI Automation：用于读取浏览器地址栏 + 文档正文（内容感知偏离判定）
+# 延迟到追踪线程内首次使用时再 import，避免主线程/无 COM 环境下报错。
+HAS_UIA = None  # None=未探测, True/False=探测结果
+
+
+def _win_set_topmost(win, on=True):
+    """对 Tk 窗口设置真正的 Windows 置顶层级（HWND_TOPMOST）。
+    overrideredirect 无边框窗口的 -topmost 属性不可靠，需要直接调用
+    SetWindowPos 才能稳定地置顶/取消置顶，且不抢焦点。
+    关键点：HWND_TOPMOST(-1) 必须以指针宽度传递，用 c_void_p 包装，
+    否则 64 位下被截断成 32 位，Windows 不认这个特殊句柄，置顶不生效。"""
+    try:
+        win.attributes('-topmost', bool(on))
+    except Exception:
+        pass
+    if sys.platform != 'win32':
+        return
+    try:
+        win.update_idletasks()
+        user32 = ctypes.windll.user32
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        # Tk 把真正的顶层 OS 窗口放在 winfo_id() 的父级
+        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010
+        insert = ctypes.c_void_p(HWND_TOPMOST if on else HWND_NOTOPMOST)
+        user32.SetWindowPos(ctypes.c_void_p(hwnd), insert, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    except Exception:
+        pass
+
+
+def _virtual_screen():
+    """返回整个虚拟桌面（跨所有显示器）的 (x, y, w, h)。
+    Tk 的 winfo_screenwidth/height 只给主屏尺寸，导致多屏下窗口被
+    误判越界并被拉回主屏。失败返回 None。"""
+    if sys.platform != 'win32':
+        return None
+    try:
+        u = ctypes.windll.user32
+        vx = u.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        vy = u.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+        vw = u.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        vh = u.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        if vw > 0 and vh > 0:
+            return (vx, vy, vw, vh)
+    except Exception:
+        pass
+    return None
+
+
+def _monitor_rect(win):
+    """返回 win 当前所在显示器的工作区 (x, y, w, h)。
+    用于吸边隐藏跟随窗口当前所在屏幕，而不是固定回主屏。失败返回 None。"""
+    if sys.platform != 'win32':
+        return None
+    try:
+        win.update_idletasks()
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+        MONITOR_DEFAULTTONEAREST = 2
+        hmon = user32.MonitorFromWindow(ctypes.c_void_p(hwnd),
+                                        MONITOR_DEFAULTTONEAREST)
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                        ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            r = mi.rcMonitor
+            return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    except Exception:
+        pass
+    return None
+
+
+def _place_centered(win, parent, w, h):
+    """把 win 居中到 parent 所在屏幕（多屏友好），并 clamp 进虚拟桌面可见区，
+    保证子窗口跟随主窗口出现在用户当前那块屏幕上，而不是固定回主屏。"""
+    x = y = None
+    try:
+        parent.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        if pw > 1 and ph > 1:
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+    except Exception:
+        pass
+    if x is None:
+        x = (win.winfo_screenwidth() - w) // 2
+        y = (win.winfo_screenheight() - h) // 2
+    vs = _virtual_screen()
+    if vs:
+        vx, vy, vw, vh = vs
+        x = max(vx, min(x, vx + vw - w))
+        y = max(vy, min(y, vy + vh - h))
+    win.geometry(f'{w}x{h}+{x}+{y}')
+
+
+def _place_overlay(win, parent, w, h):
+    """把无边框 overrideredirect 弹窗可靠地居中到 parent 当前屏幕位置。
+    解决两个老问题：
+      1) overrideredirect 窗口首次映射常忽略坐标落到 (0,0) —— 先 withdraw，
+         定位后 deiconify 并再设一次 geometry，才能稳定落在目标位置。
+      2) 用 parent.winfo_rootx/rooty（绝对屏幕坐标）定位，多屏/无边框下比
+         winfo_x 可靠，并 clamp 进虚拟桌面可见区。
+    适用于 rename/delete 这类相对父窗居中的小弹窗。"""
+    try:
+        win.withdraw()
+    except Exception:
+        pass
+    x = y = None
+    try:
+        parent.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        if pw > 1 and ph > 1:
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+    except Exception:
+        pass
+    if x is None:
+        x = (win.winfo_screenwidth() - w) // 2
+        y = (win.winfo_screenheight() - h) // 2
+    vs = _virtual_screen()
+    if vs:
+        vx, vy, vw, vh = vs
+        x = max(vx, min(x, vx + vw - w))
+        y = max(vy, min(y, vy + vh - h))
+    geo = f'+{x}+{y}'
+    try:
+        win.geometry(geo)
+        win.deiconify()
+        win.update_idletasks()
+        win.geometry(geo)
+    except Exception:
+        try:
+            win.deiconify()
+        except Exception:
+            pass
+
+
+def _asset(name):
+    """脚本同级 icons/ 下资源的绝对路径。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icons', name)
+
+
 @dataclass
 class Task:
     """任务定义"""
@@ -189,6 +382,7 @@ class Task:
     name: str
     color: str = "#4A90E2"
     created_at: str = ""
+    keywords: str = ""   # 逗号分隔的关键词画像（自动学习累积）
     
 @dataclass
 class Activity:
@@ -258,7 +452,22 @@ class Database:
                 status TEXT DEFAULT 'pending'
             )
         ''')
-        
+
+        # 任务关键词加权表（自动学习）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS task_keywords (
+                task_id TEXT,
+                term TEXT,
+                weight REAL DEFAULT 0,
+                PRIMARY KEY (task_id, term)
+            )
+        ''')
+
+        # 迁移：为老库的 tasks 表补 keywords 列
+        cols = [r[1] for r in cursor.execute("PRAGMA table_info(tasks)").fetchall()]
+        if 'keywords' not in cols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN keywords TEXT DEFAULT ''")
+
         conn.commit()
         conn.close()
     
@@ -266,9 +475,10 @@ class Database:
         conn = self.get_conn()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO tasks (id, name, color, created_at, is_active)
-            VALUES (?, ?, ?, ?, 1)
-        ''', (task.id, task.name, task.color, task.created_at or datetime.now().isoformat()))
+            INSERT OR REPLACE INTO tasks (id, name, color, created_at, is_active, keywords)
+            VALUES (?, ?, ?, ?, 1, ?)
+        ''', (task.id, task.name, task.color, task.created_at or datetime.now().isoformat(),
+              getattr(task, 'keywords', '') or ''))
         conn.commit()
         conn.close()
     
@@ -289,10 +499,50 @@ class Database:
     def get_tasks(self) -> List[Task]:
         conn = self.get_conn()
         cursor = conn.cursor()
-        cursor.execute('SELECT id, name, color, created_at FROM tasks WHERE is_active = 1 ORDER BY created_at')
-        tasks = [Task(*row) for row in cursor.fetchall()]
+        cursor.execute("SELECT id, name, color, created_at, COALESCE(keywords, '') "
+                       "FROM tasks WHERE is_active = 1 ORDER BY created_at")
+        tasks = [Task(id=r[0], name=r[1], color=r[2], created_at=r[3], keywords=r[4])
+                 for r in cursor.fetchall()]
         conn.close()
         return tasks
+
+    def bump_keywords(self, task_id: str, terms, decay: float = 1.0):
+        """将一批词累加到任务的关键词权重表。decay<1 时对历史轻微衰减以适应任务演变。"""
+        if not task_id or not terms:
+            return
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        if decay < 1.0:
+            cursor.execute("UPDATE task_keywords SET weight = weight * ? WHERE task_id = ?",
+                           (decay, task_id))
+        for term in terms:
+            cursor.execute('''
+                INSERT INTO task_keywords (task_id, term, weight) VALUES (?, ?, 1)
+                ON CONFLICT(task_id, term) DO UPDATE SET weight = weight + 1
+            ''', (task_id, term))
+        conn.commit()
+        conn.close()
+
+    def get_top_keywords(self, task_id: str, limit: int = 20):
+        """返回 [(term, weight), ...]，按权重降序。"""
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT term, weight FROM task_keywords WHERE task_id = ? "
+                       "ORDER BY weight DESC LIMIT ?", (task_id, limit))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def sync_task_keywords_field(self, task_id: str, limit: int = 12):
+        """把 top 关键词回写到 tasks.keywords 字段（逗号分隔），供快速读取。"""
+        top = self.get_top_keywords(task_id, limit)
+        kw = ",".join(t for t, _ in top)
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE tasks SET keywords = ? WHERE id = ?", (kw, task_id))
+        conn.commit()
+        conn.close()
+        return kw
     
     def save_activity(self, activity: Activity):
         conn = self.get_conn()
@@ -465,6 +715,222 @@ class WindowTracker:
             return 0
 
 
+# 关键词抽取：中文 2/3-gram + 英文词，供自动学习加权与本地预筛
+_RE_CJK = re.compile(r'[一-鿿]+')
+_RE_EN = re.compile(r'[A-Za-z][A-Za-z0-9+#.\-]{1,}')
+_EN_STOP = {'the', 'and', 'for', 'you', 'are', 'http', 'https', 'www', 'com', 'cn',
+            'html', 'with', 'this', 'that', 'from', 'not', 'has', 'was', '但是',
+            'new', 'get', 'all', 'can', 'org', 'net'}
+# 高频中文虚词二元组，作为噪声过滤
+_CN_STOP2 = {'我们', '你们', '他们', '这个', '那个', '一个', '可以', '因为', '所以',
+             '但是', '如果', '就是', '这样', '那样', '什么', '怎么', '没有', '还是',
+             '这些', '那些', '自己', '现在', '已经', '不是', '或者', '而且'}
+
+
+def extract_terms(text, limit=60):
+    """从文本抽取候选关键词集合（去重）。返回 list。"""
+    if not text:
+        return []
+    low = text.lower()
+    terms = set()
+    for w in _RE_EN.findall(low):
+        w = w.strip('.-')
+        if len(w) >= 2 and w not in _EN_STOP:
+            terms.add(w)
+    for run in _RE_CJK.findall(text):
+        n = len(run)
+        for i in range(n - 1):
+            bg = run[i:i + 2]
+            if bg not in _CN_STOP2:
+                terms.add(bg)
+        for i in range(n - 2):
+            terms.add(run[i:i + 3])
+    return list(terms)[:limit]
+
+
+class ContentReader:
+    """用 UI Automation 读取前台窗口的网址与正文摘要。
+    抓不到就返回空串，绝不抛异常、绝不阻塞 UI（搜索超时受 SetGlobalSearchTimeout 限制）。"""
+    _BROWSERS = ('chrome.exe', 'msedge.exe', 'edge.exe', 'firefox.exe', 'opera.exe',
+                 'brave.exe', '360se.exe', '360chrome.exe', 'qqbrowser.exe')
+    _uia = None
+
+    @staticmethod
+    def _ensure():
+        """首次在当前线程调用时初始化 uiautomation（会自动初始化本线程 COM）。"""
+        global HAS_UIA
+        if HAS_UIA is not None:
+            return HAS_UIA
+        try:
+            import uiautomation as _uia
+            _uia.SetGlobalSearchTimeout(1.0)
+            ContentReader._uia = _uia
+            HAS_UIA = True
+        except Exception as e:
+            print(f"[内容抓取] uiautomation 不可用，降级: {e}")
+            HAS_UIA = False
+        return HAS_UIA
+
+    @staticmethod
+    def is_browser(app_name):
+        return any(b in (app_name or '').lower() for b in ContentReader._BROWSERS)
+
+    @staticmethod
+    def read(hwnd, app_name, want_body=True, body_limit=500):
+        result = {'url': '', 'body': ''}
+        if not hwnd or not ContentReader._ensure():
+            return result
+        uia = ContentReader._uia
+        is_browser = ContentReader.is_browser(app_name)
+        try:
+            win = uia.ControlFromHandle(hwnd)
+            if not win:
+                return result
+            if is_browser:
+                result['url'] = ContentReader._read_url(win)
+            if want_body:
+                result['body'] = ContentReader._read_body(win, is_browser, body_limit)
+        except Exception as e:
+            print(f"[内容抓取] 失败: {e}")
+        return result
+
+    @staticmethod
+    def _read_url(win):
+        try:
+            edit = win.EditControl(searchDepth=12)
+            if edit.Exists(0.6, 0.1):
+                try:
+                    v = edit.GetValuePattern().Value
+                except Exception:
+                    v = edit.Name
+                v = (v or '').strip()
+                # 粗过滤：地址栏值一般无空格；纯提示文案（如“搜索或输入网址”）含空格
+                if v and ' ' not in v:
+                    return v
+        except Exception:
+            pass
+        return ''
+
+    @staticmethod
+    def _read_body(win, is_browser, limit):
+        # 优先文档控件，读 TextPattern（GetText 传 maxLength 防止拉取整页）
+        try:
+            doc = win.DocumentControl(searchDepth=25)
+            if doc.Exists(0.8, 0.1):
+                try:
+                    txt = doc.GetTextPattern().DocumentRange.GetText(limit * 3)
+                    txt = ContentReader._clean(txt, limit)
+                    if txt:
+                        return txt
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 退回：收集顶层子控件的 Name 文本
+        try:
+            parts = []
+            total = 0
+            for c in win.GetChildren():
+                n = (c.Name or '').strip()
+                if n:
+                    parts.append(n)
+                    total += len(n)
+                if total > limit:
+                    break
+            return ContentReader._clean(' '.join(parts), limit)
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _clean(txt, limit):
+        if not txt:
+            return ''
+        return ' '.join(txt.split())[:limit]
+
+
+class ArkClient:
+    """火山方舟偏离判定客户端。给定任务与当前内容，返回 (relation, reason)。
+    relation ∈ related|maybe_drift|drift；任何失败/超时都返回 None 交由上层降级。"""
+
+    def __init__(self, cfg):
+        self.api_key = cfg.get('ark_api_key', '')
+        self.endpoint = cfg.get('ark_endpoint', '')
+        self.model = cfg.get('ark_model', '')
+        self._cache = {}       # key -> (ts, relation, reason)
+        self._cache_ttl = 60   # 同一内容 60s 内不重复调用
+
+    def available(self):
+        return bool(self.api_key and self.endpoint and self.model)
+
+    def classify(self, task_name, keywords, app, title, url, body):
+        if not self.available():
+            return None
+        key = f"{task_name}|{app}|{url}|{title}|{(body or '')[:80]}"
+        now = time.time()
+        hit = self._cache.get(key)
+        if hit and now - hit[0] < self._cache_ttl:
+            return (hit[1], hit[2])
+
+        sysmsg = ('你是工作偏离判定器。只输出一个 JSON：'
+                  '{"relation":"related|maybe_drift|drift","reason":"一句话中文"}。不要输出多余内容。')
+        parts = [f"任务: {task_name}"]
+        if keywords:
+            parts.append(f"关键词: {keywords}")
+        cur = f"当前: 进程={app} 标题={title}"
+        if url:
+            cur += f" 网址={url}"
+        parts.append(cur)
+        if body:
+            parts.append(f"正文摘要: {body}")
+        usermsg = "\n".join(parts)
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": sysmsg},
+                         {"role": "user", "content": usermsg}],
+            "temperature": 0.2,
+            "max_tokens": 256,
+        }
+        try:
+            req = urllib.request.Request(
+                self.endpoint,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {self.api_key}"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode('utf-8'))
+            content = data["choices"][0]["message"]["content"]
+            relation, reason = self._parse(content)
+            if relation:
+                self._cache[key] = (now, relation, reason)
+                return (relation, reason)
+            return None
+        except Exception as e:
+            print(f"[AI判定] 失败降级: {e}")
+            return None
+
+    @staticmethod
+    def _parse(content):
+        obj = None
+        try:
+            obj = json.loads(content)
+        except Exception:
+            import re
+            m = re.search(r'\{.*\}', content or '', re.S)
+            if m:
+                try:
+                    obj = json.loads(m.group(0))
+                except Exception:
+                    obj = None
+        if not isinstance(obj, dict):
+            return (None, '')
+        rel = obj.get('relation', '')
+        if rel not in ('related', 'maybe_drift', 'drift'):
+            return (None, '')
+        return (rel, obj.get('reason', ''))
+
+
 class SystemTray:
     """系统托盘图标 - 使用 win32gui 实现（比 ctypes 更可靠）"""
     
@@ -488,11 +954,24 @@ class SystemTray:
         
         hinst = win32api.GetModuleHandle(None)
         
-        # 加载图标 - 尝试 Python 图标，回退到系统默认
+        # 加载托盘图标：优先用打包的 worktrace.ico（取系统小图标尺寸，托盘最清晰），
+        # 失败再回退到脚本资源 / 系统默认图标。
+        self._hicon = None
+        ico = _asset('worktrace.ico')
         try:
-            self._hicon = win32gui.LoadIcon(hinst, 1)
-        except Exception:
-            self._hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+            if os.path.exists(ico):
+                cx = win32api.GetSystemMetrics(win32con.SM_CXSMICON) or 16
+                cy = win32api.GetSystemMetrics(win32con.SM_CYSMICON) or 16
+                self._hicon = win32gui.LoadImage(
+                    0, ico, win32con.IMAGE_ICON, cx, cy,
+                    win32con.LR_LOADFROMFILE)
+        except Exception as e:
+            print(f"[托盘] 加载自定义图标失败: {e}")
+        if not self._hicon:
+            try:
+                self._hicon = win32gui.LoadIcon(hinst, 1)
+            except Exception:
+                self._hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
         
         # 窗口消息处理映射
         message_map = {
@@ -650,20 +1129,27 @@ def _bind_full_drag(win, *widgets, on_snap_save=None):
     def _end(e):
         if not hasattr(win, '_drag_x'):
             return
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
+        vs = _virtual_screen()
+        if vs:
+            vx, vy, vw, vh = vs
+        else:
+            vx, vy = 0, 0
+            vw = win.winfo_screenwidth()
+            vh = win.winfo_screenheight()
         ww = win.winfo_width()
         wh = win.winfo_height()
         x = win.winfo_x()
         y = win.winfo_y()
-        if x < SNAP:
-            x = 0
-        elif x > sw - ww - SNAP:
-            x = sw - ww
-        if y < SNAP:
-            y = 0
-        elif y > sh - wh - SNAP:
-            y = sh - wh
+        # 仅在贴近整个虚拟桌面的外缘时磁吸，屏幕之间的内缝不吸，
+        # 这样窗口可以自由停在副屏 B 上，不会被拉回主屏 A。
+        if x < vx + SNAP:
+            x = vx
+        elif x > vx + vw - ww - SNAP:
+            x = vx + vw - ww
+        if y < vy + SNAP:
+            y = vy
+        elif y > vy + vh - wh - SNAP:
+            y = vy + vh - wh
         win.geometry(f'+{x}+{y}')
         if on_snap_save:
             on_snap_save()
@@ -681,6 +1167,74 @@ def _bind_full_drag(win, *widgets, on_snap_save=None):
     win.bind('<Button-1>', _start, add='+')
     win.bind('<B1-Motion>', _move, add='+')
     win.bind('<ButtonRelease-1>', _end, add='+')
+
+
+def _bind_title_drag(win, *widgets, on_snap_save=None):
+    """仅让指定的标题栏 widget（及其子树）可拖动窗口，内容区不参与拖拽。
+    跳过按钮（cursor='hand2'）和输入框。用于设置/统计/任务列表等含交互控件的面板，
+    避免拖动滑块/内容时误拖窗口。全局统一：面板一律标题栏拖拽。"""
+    SNAP = 20
+
+    def _start(e):
+        w = e.widget
+        try:
+            if str(w.cget('cursor')) == 'hand2':
+                return
+        except Exception:
+            pass
+        if isinstance(w, (tk.Entry, tk.Scale, tk.Scrollbar)):
+            return
+        win._drag_x = e.x_root - win.winfo_x()
+        win._drag_y = e.y_root - win.winfo_y()
+
+    def _move(e):
+        if not hasattr(win, '_drag_x'):
+            return
+        win.geometry(f'+{e.x_root - win._drag_x}+{e.y_root - win._drag_y}')
+
+    def _end(e):
+        if not hasattr(win, '_drag_x'):
+            return
+        vs = _virtual_screen()
+        if vs:
+            vx, vy, vw, vh = vs
+        else:
+            vx, vy = 0, 0
+            vw = win.winfo_screenwidth()
+            vh = win.winfo_screenheight()
+        ww, wh = win.winfo_width(), win.winfo_height()
+        x, y = win.winfo_x(), win.winfo_y()
+        if x < vx + SNAP:
+            x = vx
+        elif x > vx + vw - ww - SNAP:
+            x = vx + vw - ww
+        if y < vy + SNAP:
+            y = vy
+        elif y > vy + vh - wh - SNAP:
+            y = vy + vh - wh
+        win.geometry(f'+{x}+{y}')
+        delattr(win, '_drag_x')
+        if hasattr(win, '_drag_y'):
+            delattr(win, '_drag_y')
+        if on_snap_save:
+            on_snap_save()
+
+    def _bind_tree(widget):
+        _start_ok = True
+        try:
+            if str(widget.cget('cursor')) == 'hand2':
+                _start_ok = False
+        except Exception:
+            pass
+        if not isinstance(widget, tk.Entry) and _start_ok:
+            widget.bind('<Button-1>', _start, add='+')
+            widget.bind('<B1-Motion>', _move, add='+')
+            widget.bind('<ButtonRelease-1>', _end, add='+')
+        for child in widget.winfo_children():
+            _bind_tree(child)
+
+    for w in widgets:
+        _bind_tree(w)
 
 
 class CyberScrollbar(tk.Canvas):
@@ -732,6 +1286,7 @@ class ModernDialog:
         self._input_index = len(self.options)
         self._option_rows = []
         self._focused = False
+        self._modal_child = None
 
         self.root = tk.Toplevel(parent)
         self.root.title(title)
@@ -744,20 +1299,31 @@ class ModernDialog:
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         w = 480
-        chrome_h = 270
-        row_h = 37
-        max_visible_rows = 7
+        row_h = 47
+        max_visible_rows = 8
         visible_rows = min(max(len(self.options), 3), max_visible_rows)
-        desired_h = chrome_h + visible_rows * row_h
-        max_h = sh - 80
-        h = min(max(350, desired_h), max_h)
-        self._options_area_h = max(111, min(visible_rows * row_h, h - chrome_h))
+        # 给选项区固定可见高度（满行，不再被估算的 chrome 高度反向挤压）；
+        # 行数超过可见上限才滚动。窗口最终高度在 _finalize_size 里按实测内容决定，
+        # 避免估算 chrome 偏小导致最底行被裁切。
+        self._options_area_h = max(111, visible_rows * row_h)
         self._needs_option_scroll = len(self.options) > max_visible_rows
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.root.geometry(f'{w}x{h}+{x}+{y}')
+        self._dialog_w = w
+        self._dialog_max_h = sh - 80
+        self._dialog_parent = parent
+        _place_centered(self.root, parent, w, 420)
 
         self._create_ui(title)
+        self._finalize_size()
+
+    def _finalize_size(self):
+        """按实测内容高度确定窗口高度，避免估算 chrome 偏差导致最底行被裁切。"""
+        try:
+            self.root.update_idletasks()
+            req_h = self.bd.winfo_reqheight() + 18
+            h = max(350, min(req_h, self._dialog_max_h))
+            _place_centered(self.root, self._dialog_parent, self._dialog_w, h)
+        except Exception:
+            pass
 
     def _create_ui(self, title: str):
         t = theme()
@@ -826,11 +1392,13 @@ class ModernDialog:
                  font=('Microsoft YaHei', 8, 'bold'),
                  bg=t["cream"], fg=t["black"], anchor='w').pack(fill='x', padx=14, pady=(0, 8))
 
-        options_shell = tk.Frame(inner, bg=t["cream"], height=self._options_area_h)
+        options_shell = tk.Frame(inner, bg=t["cream"])
         options_shell.pack(fill='x', padx=14)
-        options_shell.pack_propagate(False)
 
         if self._needs_option_scroll:
+            # 任务多于可见上限：固定可视高度 + 滚动条
+            options_shell.configure(height=self._options_area_h)
+            options_shell.pack_propagate(False)
             options_canvas = tk.Canvas(options_shell, bg=t["cream"],
                                        highlightthickness=0, bd=0)
             options_scroll = CyberScrollbar(options_shell, options_canvas.yview)
@@ -847,9 +1415,13 @@ class ModernDialog:
             self._options_canvas = options_canvas
             self._options_scroll = options_scroll
         else:
+            # 任务不多：让选项区按实际行高自适应（不固定高度），窗口高度由
+            # _finalize_size 实测决定，避免最底行被裁切
             options_wrap = tk.Frame(options_shell, bg=t["cream"])
             options_wrap.pack(fill='both', expand=True)
             self._options_canvas = None
+
+        self._options_wrap = options_wrap
 
         if self.options:
             for i, opt in enumerate(self.options):
@@ -932,12 +1504,37 @@ class ModernDialog:
             if hasattr(self.root, '_drag_y'):
                 delattr(self.root, '_drag_y')
 
-        for widget in widgets:
+        def bind_one(widget):
+            # 跳过交互控件（按钮 hand2 / 输入框），其余区域可拖拽
+            try:
+                if str(widget.cget('cursor')) == 'hand2':
+                    return
+            except Exception:
+                pass
+            if isinstance(widget, tk.Entry):
+                return
             widget.bind('<Button-1>', start, add='+')
             widget.bind('<B1-Motion>', move, add='+')
             widget.bind('<ButtonRelease-1>', end, add='+')
 
+        def bind_tree(widget):
+            bind_one(widget)
+            for child in widget.winfo_children():
+                bind_tree(child)
+
+        for widget in widgets:
+            bind_tree(widget)
+
     def _activate_focus(self):
+        # 重命名/删除等模态子窗打开时，主弹窗不要抢焦点——focus_set 在 Windows 上
+        # 会把主弹窗抬到置顶子窗之上，导致子窗看似"隐藏"。
+        if getattr(self, '_modal_child', None) is not None:
+            try:
+                if self._modal_child.winfo_exists():
+                    self._modal_child.lift()
+                    return
+            except Exception:
+                self._modal_child = None
         self._set_panel_focus(True)
         if self.root.focus_get() != self.entry:
             self.root.focus_set()
@@ -1172,6 +1769,7 @@ class ModernDialog:
             return
         t = theme()
         d = tk.Toplevel(self.root)
+        d.withdraw()
         d.overrideredirect(True)
         d.configure(bg=t["cream"])
         d.attributes('-topmost', True)
@@ -1193,31 +1791,82 @@ class ModernDialog:
         e.select_range(0, 'end')
         e.focus_set()
 
+        def _close_edit(ev=None):
+            self._modal_child = None
+            try:
+                d.grab_release()
+            except Exception:
+                pass
+            d.destroy()
+
         def do_save(ev=None):
             new_name = e.get().strip()
             if new_name and new_name != option_text:
-                self.on_task_edit(task_id, new_name)
-            self.result = new_name or option_text
-            d.destroy()
-            self.root.destroy()
+                if self.on_task_edit:
+                    self.on_task_edit(task_id, new_name)
+                try:
+                    idx = self.task_ids.index(task_id)
+                    self.options[idx] = new_name
+                except ValueError:
+                    pass
+                self._rebuild_options()
+            _close_edit()
 
         e.bind('<Return>', do_save)
-        e.bind('<Escape>', lambda ev: d.destroy())
+        e.bind('<Escape>', _close_edit)
 
-        self.root.update_idletasks()
-        rx = self.root.winfo_x() + (self.root.winfo_width() - 280) // 2
-        ry = self.root.winfo_y() + (self.root.winfo_height() - 80) // 2
-        d.geometry(f'+{rx}+{ry}')
+        _place_overlay(d, self.root, 280, 80)
+        e.focus_set()
+        _win_set_topmost(d, True)
+        # 标记为模态子窗：主弹窗在此期间不抢焦点；grab_set 双保险。
+        self._modal_child = d
+        d.bind('<Destroy>', lambda ev: setattr(self, '_modal_child', None) if ev.widget is d else None)
+        try:
+            d.grab_set()
+        except Exception:
+            pass
 
     def _delete_task(self, task_id, task_name):
         if self.on_task_delete:
             confirmed = self.on_task_delete(task_id, task_name)
             if confirmed:
-                self.result = f"DELETE:{task_id}"
-                self.root.destroy()
+                try:
+                    idx = self.task_ids.index(task_id)
+                    self.task_ids.pop(idx)
+                    self.options.pop(idx)
+                except ValueError:
+                    pass
+                self._rebuild_options()
+
+    def _rebuild_options(self):
+        wrap = getattr(self, '_options_wrap', None)
+        if not wrap:
+            return
+        for child in wrap.winfo_children():
+            child.destroy()
+        self._option_rows = []
+        self._input_index = len(self.options)
+        if self._selected_index > len(self.options):
+            self._selected_index = self._input_index
+        t = theme()
+        if self.options:
+            for i, opt in enumerate(self.options):
+                self._make_option_row(wrap, i, opt)
+        else:
+            empty = tk.Frame(wrap, bg=t["cream"], highlightthickness=3,
+                             highlightbackground=t["black"])
+            empty.pack(fill='x', pady=(0, 8))
+            tk.Label(empty, text="NO TASKS · ADD BELOW",
+                     font=('JetBrains Mono', 10, 'bold'),
+                     bg=t["cream"], fg=t["red"]).pack(pady=15)
+        if getattr(self, '_options_canvas', None):
+            self._options_canvas.update_idletasks()
+            self._options_canvas.configure(scrollregion=self._options_canvas.bbox('all'))
+        self._refresh_selection()
 
     def show(self) -> Optional[str]:
         self.root.lift()
+        _win_set_topmost(self.root, True)
         self._parent.wait_window(self.root)
         return self.result
 
@@ -1243,6 +1892,7 @@ class SettingsWindow:
         self._vars = {}
         self._sliders = {}      # key -> {'canvas','draw','val_lbl','min','max','step','unit'}
         self._toggles = {}      # key -> {'canvas','draw'}
+        self._orig_auto_launch = bool(cfg.get("auto_launch", False))
 
         t = self.theme()
         self.win = tk.Toplevel(parent)
@@ -1253,16 +1903,14 @@ class SettingsWindow:
 
         self.win.update_idletasks()
         w, h = 340, 600
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.win.geometry(f'{w}x{h}+{x}+{y}')
+        _place_centered(self.win, parent, w, h)
 
         self._create_ui()
 
         self.win.bind('<Escape>', lambda e: self.win.destroy())
         self.win.bind('<Control-s>', lambda e: self._save())
+        self.win.focus_set()
+        _win_set_topmost(self.win, True)
 
     # ---------- UI 构建 ----------
     def _create_ui(self):
@@ -1316,41 +1964,50 @@ class SettingsWindow:
         # ---- 专注节奏 ----
         self._make_plate(content, "专注节奏")
         self._make_slider(content, "专注单元", "pomodoro_minutes",
-                          5, 60, self.cfg.get("pomodoro_minutes", 30), 5, "m",
+                          5, 60, self.cfg.get("pomodoro_minutes", 30), 5, "分钟",
                           "一轮连续投入工作的目标时长，主面板进度条按这个周期循环。")
         self._make_slider(content, "短恢复", "rest_per_pomodoro",
-                          1, 30, self.cfg.get("rest_per_pomodoro", 5), 1, "m",
+                          1, 30, self.cfg.get("rest_per_pomodoro", 5), 1, "分钟",
                           "每完成一个专注单元后，系统用于统计建议恢复时间的基准。")
         self._make_slider(content, "长恢复", "long_rest_minutes",
-                          5, 60, self.cfg.get("long_rest_minutes", 15), 5, "m",
+                          5, 60, self.cfg.get("long_rest_minutes", 15), 5, "分钟",
                           "连续完成多轮专注后建议安排的一段较长恢复时间。")
 
         # ---- 追踪阈值 ----
         self._make_plate(content, "追踪阈值")
         self._make_slider(content, "检测频率", "check_interval",
-                          60, 300, self.cfg["check_interval"], 60, "s",
-                          "后台检查当前窗口、空闲状态和偏离状态的间隔。数值越小越敏感。")
+                          1, 5, int(self.cfg["check_interval"] // 60), 1, "分钟",
+                          "后台检查当前窗口、空闲状态和偏离状态的间隔。数值越小越敏感。",
+                          scale=60)
         self._make_slider(content, "离开判定", "idle_threshold",
-                          60, 900, self.cfg["idle_threshold"], 60, "s",
-                          "鼠标键盘无操作超过该时间后，自动记为离开/空闲。")
+                          1, 15, int(self.cfg["idle_threshold"] // 60), 1, "分钟",
+                          "鼠标键盘无操作超过该时间后，自动记为离开/空闲。",
+                          scale=60)
         self._make_slider(content, "偏离容忍", "reminder_interval",
-                          120, 1800, self.cfg["reminder_interval"], 60, "s",
-                          "当前窗口与任务上下文不一致持续超过该时间后，弹出确认。")
+                          2, 30, int(self.cfg["reminder_interval"] // 60), 1, "分钟",
+                          "当前窗口与任务上下文不一致持续超过该时间后，弹出确认。",
+                          scale=60)
         self._make_slider(content, "锁屏检测", "lock_check_interval",
-                          1, 10, self.cfg["lock_check_interval"], 1, "s",
-                          "检查系统是否锁屏的间隔，用于更快记录锁屏/离开。")
+                          1, 10, self.cfg["lock_check_interval"], 1, "秒",
+                          "检查系统是否锁屏的间隔（秒级轮询），用于更快记录锁屏/离开。")
         self._make_slider(content, "无操作判定", "no_input_threshold",
-                          60, 600, self.cfg.get("no_input_threshold", 180), 30, "s",
-                          "无鼠标键盘输入超过该时间后，累计到今日无操作统计。")
+                          1, 10, int(self.cfg.get("no_input_threshold", 180) // 60), 1, "分钟",
+                          "无鼠标键盘输入超过该时间后，累计到今日无操作统计。",
+                          scale=60)
 
         # ---- 启动 ----
         self._make_plate(content, "启动")
         self._make_toggle(content, "完成提示音", "pomodoro_sound")
-        self._make_toggle(content, "窗口置顶", "always_on_top")
+        self._make_toggle(content, "吸边隐藏", "edge_hide")
         self._make_toggle(content, "关闭到托盘", "minimize_to_tray")
         self._make_toggle(content, "静默启动", "silent_start")
         self._make_toggle(content, "自动追踪", "auto_start_track")
         self._make_toggle(content, "开机自启", "auto_launch")
+
+        # ---- AI 判定 ----
+        self._make_plate(content, "AI 判定")
+        self._make_toggle(content, "内容感知偏离", "ai_enabled")
+        self._make_toggle(content, "正文外发", "body_send")
 
         tk.Frame(bd, bg=t["black"], height=4).pack(fill='x', pady=(8, 0))
 
@@ -1371,8 +2028,8 @@ class SettingsWindow:
         self._make_metal_btn(right_box, "保存", self._save,
                              kind='primary').pack(side='left')
 
-        # 拖拽 — 全窗口
-        _bind_full_drag(self.win, self.win)
+        # 拖拽 — 仅标题栏
+        _bind_title_drag(self.win, hdr)
 
     # ---------- 视觉组件 ----------
     def _make_plate(self, parent, text):
@@ -1393,6 +2050,7 @@ class SettingsWindow:
         self._hide_help_tip()
         t = self.theme()
         tip = tk.Toplevel(self.win)
+        tip.withdraw()
         tip.overrideredirect(True)
         tip.attributes('-topmost', True)
         tip.configure(bg=t["black"])
@@ -1403,7 +2061,11 @@ class SettingsWindow:
                  justify='left', wraplength=220).pack()
         x = widget.winfo_rootx() + 14
         y = widget.winfo_rooty() + 16
-        tip.geometry(f'+{x}+{y}')
+        geo = f'+{x}+{y}'
+        tip.geometry(geo)
+        tip.deiconify()
+        tip.update_idletasks()
+        tip.geometry(geo)  # overrideredirect 首次映射可能落到 (0,0)，再设一次
         self._help_tip = tip
 
     def _hide_help_tip(self):
@@ -1416,7 +2078,7 @@ class SettingsWindow:
         self._help_tip = None
 
     def _make_slider(self, parent, label, key, min_val, max_val,
-                     current, step, unit, help_text=None):
+                     current, step, unit, help_text=None, scale=1):
         t = self.theme()
         row = tk.Frame(parent, bg=t["white"])
         row.pack(fill='x', pady=5)
@@ -1435,7 +2097,7 @@ class SettingsWindow:
             help_lbl.bind('<Leave>', lambda e: self._hide_help_tip())
 
         val_lbl = tk.Label(row, text=f"{current}{unit}", font=('JetBrains Mono', 10, 'bold'),
-                           bg=t["white"], fg=t["red"], anchor='e', width=6)
+                           bg=t["white"], fg=t["red"], anchor='e', width=7)
         val_lbl.pack(side='right')
 
         cw, ch = 132, 24
@@ -1481,6 +2143,7 @@ class SettingsWindow:
         self._sliders[key] = {
             'canvas': c, 'draw': draw, 'val_lbl': val_lbl,
             'min': min_val, 'max': max_val, 'step': step, 'unit': unit,
+            'scale': scale,
         }
 
     def _make_toggle(self, parent, label, key):
@@ -1539,39 +2202,38 @@ class SettingsWindow:
     # ---------- 操作 ----------
     def _save(self):
         for key, var in self._vars.items():
-            self.cfg[key] = var.get()
-        save_config(self.cfg)
+            val = var.get()
+            info = self._sliders.get(key)
+            if info and info.get('scale', 1) != 1:
+                val = val * info['scale']  # 显示单位(分钟)→存储单位(秒)
+            self.cfg[key] = val
+        cfg_snapshot = dict(self.cfg)
+        auto_changed = bool(cfg_snapshot.get("auto_launch", False)) != self._orig_auto_launch
+        on_save = self.on_save
+        parent = self.parent
 
-        # 开机自启
-        auto = self.cfg.get("auto_launch", False)
-        try:
-            import winreg
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            app_name = "TimeTracker"
-            script_path = os.path.join(SCRIPT_DIR, "time_tracker_v2.py")
-            pythonw_path = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-            if not os.path.exists(pythonw_path):
-                pythonw_path = sys.executable
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-            if auto:
-                launch_cmd = f'"{pythonw_path}" "{script_path}"'
-                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, launch_cmd)
-            else:
-                try:
-                    winreg.DeleteValue(key, app_name)
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
-        except Exception as e:
-            print(f"[开机自启动] 设置失败: {e}")
-
-        if self.on_save:
-            self.on_save(self.cfg)
+        # 先关闭窗口，让界面立即响应；保存/注册表等放到下一帧执行
         self.win.destroy()
+
+        def _persist():
+            save_config(cfg_snapshot)
+            if auto_changed:
+                _apply_auto_launch(cfg_snapshot.get("auto_launch", False))
+            if on_save:
+                on_save(cfg_snapshot)
+
+        try:
+            parent.after(0, _persist)
+        except Exception:
+            _persist()
 
     def _reset_defaults(self):
         for key, var in self._vars.items():
-            var.set(DEFAULT_CONFIG.get(key, var.get()))
+            default = DEFAULT_CONFIG.get(key, var.get())
+            info = self._sliders.get(key)
+            if info and info.get('scale', 1) != 1 and isinstance(default, (int, float)):
+                default = int(default // info['scale'])  # 存储单位(秒)→显示单位(分钟)
+            var.set(default)
         # 刷新滑块/开关
         for key, info in self._sliders.items():
             v = self._vars.get(key)
@@ -1597,11 +2259,7 @@ class StatsWindow:
 
         self.win.update_idletasks()
         self._stats_w = 520
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
-        x = (sw - self._stats_w) // 2
-        y = max(40, (sh - 460) // 2)
-        self.win.geometry(f'{self._stats_w}x460+{x}+{y}')
+        _place_centered(self.win, parent, self._stats_w, 460)
 
         self._create_ui()
         self._load_data()
@@ -1737,14 +2395,19 @@ class StatsWindow:
                                    bg=t["cream"], fg=t["muted"])
         self.footer_lbl.pack()
 
-        # 拖拽
-        _bind_full_drag(self.win, self.win)
+        # 拖拽 — 仅标题栏
+        _bind_title_drag(self.win, titlebar)
 
     def _fit_height(self):
         self.win.update_idletasks()
-        req_h = min(max(420, self.win.winfo_reqheight() + 2), self.win.winfo_screenheight() - 80)
+        vs = _virtual_screen()
+        if vs:
+            vy, vh = vs[1], vs[3]
+        else:
+            vy, vh = 0, self.win.winfo_screenheight()
+        req_h = min(max(420, self.win.winfo_reqheight() + 2), vh - 80)
         x = self.win.winfo_x()
-        y = max(40, min(self.win.winfo_y(), self.win.winfo_screenheight() - req_h - 40))
+        y = max(vy + 40, min(self.win.winfo_y(), vy + vh - req_h - 40))
         self.win.geometry(f'{self._stats_w}x{req_h}+{x}+{y}')
         self._draw_scanline()
 
@@ -2033,11 +2696,7 @@ class TaskManagerWindow:
 
         self.win.update_idletasks()
         w, h = 420, 400
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.win.geometry(f'{w}x{h}+{x}+{y}')
+        _place_centered(self.win, parent, w, h)
 
         self._create_ui()
         self._refresh_list()
@@ -2113,7 +2772,7 @@ class TaskManagerWindow:
         self.new_entry.bind('<FocusIn>', self._on_new_entry_focus)
         self.new_entry.bind('<Return>', lambda e: self._add_task())
 
-        _bind_full_drag(self.win, self.win)
+        _bind_title_drag(self.win, hdr)
 
     def _draw_scanline(self):
         c = self._scanline_canvas
@@ -2238,6 +2897,7 @@ class TaskManagerWindow:
         old_name = task.name
 
         d = tk.Toplevel(self.win)
+        d.withdraw()
         d.overrideredirect(True)
         d.configure(bg=t["cream"])
         d.attributes('-topmost', True)
@@ -2273,14 +2933,18 @@ class TaskManagerWindow:
         e.bind('<Return>', do_save)
         e.bind('<Escape>', lambda ev: d.destroy())
 
-        self.win.update_idletasks()
-        rx = self.win.winfo_x() + (self.win.winfo_width() - 260) // 2
-        ry = self.win.winfo_y() + (self.win.winfo_height() - 80) // 2
-        d.geometry(f'+{rx}+{ry}')
+        _place_overlay(d, self.win, 260, 80)
+        e.focus_set()
+        _win_set_topmost(d, True)
+        try:
+            d.grab_set()
+        except Exception:
+            pass
 
     def _delete_task(self, task):
         t = theme()
         d = tk.Toplevel(self.win)
+        d.withdraw()
         d.overrideredirect(True)
         d.configure(bg=t["cream"])
         d.attributes('-topmost', True)
@@ -2334,10 +2998,12 @@ class TaskManagerWindow:
 
         d.bind('<Escape>', lambda e: d.destroy())
 
-        self.win.update_idletasks()
-        rx = self.win.winfo_x() + (self.win.winfo_width() - 220) // 2
-        ry = self.win.winfo_y() + (self.win.winfo_height() - 90) // 2
-        d.geometry(f'+{rx}+{ry}')
+        _place_overlay(d, self.win, 220, 90)
+        _win_set_topmost(d, True)
+        try:
+            d.grab_set()
+        except Exception:
+            pass
 
     def _add_task(self):
         name = self.new_entry.get().strip()
@@ -2392,8 +3058,13 @@ class ControlPanel:
         self.tracker = tracker
         self.root = tk.Tk()
         self.root.title("W / TRACE")
+        try:
+            ico = _asset('worktrace.ico')
+            if os.path.exists(ico):
+                self.root.iconbitmap(ico)
+        except Exception:
+            pass
         self.root.overrideredirect(True)
-        self.root.attributes('-topmost', config.get("always_on_top", True))
 
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
@@ -2421,6 +3092,13 @@ class ControlPanel:
         self._tick_pulse_dir = 1
         self._badge_pulse_dir = 1
         self._cached_state = None
+        # 吸边隐藏状态机
+        self._edge_state = 'free'   # 'free' 自由常显 | 'hidden' 吸边隐藏 | 'shown' 唤出
+        self._snap_edge = None      # 'left' | 'right'
+        self._reveal_strip = None   # 露出条 Toplevel
+        self._reveal_canvas = None
+        self._strip_w = 6           # 露出条宽度(px)
+        self._hidden_geo = None     # (x, y, w, h)，唤出/隐藏时恢复用
 
         t = self.theme()
         self.root.configure(bg=t["cream"])
@@ -2439,6 +3117,10 @@ class ControlPanel:
         if not self.tracker.today_tasks and self.tracker.running:
             self.root.after(800, self._switch_task)
 
+        # 吸边模式：唤出后鼠标离开窗口即收起；启动时按当前模式设置置顶层级
+        self.root.bind('<Leave>', self._on_root_leave, add='+')
+        self._apply_window_level()
+
     def theme(self):
         return {
             "red": "#FF6B6B",
@@ -2451,8 +3133,28 @@ class ControlPanel:
         }
 
     def show_window(self):
+        # 吸边隐藏态下先恢复成自由常显，避免唤起后仍是露出条
+        if config.get("edge_hide", False) and self._edge_state != 'free':
+            try:
+                self._hide_reveal_strip()
+                self._edge_state = 'free'
+                self._snap_edge = None
+            except Exception:
+                pass
         self.root.deiconify()
         self.root.lift()
+        # 一次性提到前台（闪一下 topmost 再取消，不常驻置顶）
+        try:
+            _win_set_topmost(self.root, True)
+            self.root.after(180, lambda: _win_set_topmost(self.root, False))
+        except Exception:
+            pass
+        # 已打开的子窗口(菜单/弹窗)重新提到最上，避免被唤起的主窗盖住
+        try:
+            if self._menu_window and self._menu_window.winfo_exists():
+                _win_set_topmost(self._menu_window, True)
+        except Exception:
+            pass
 
     def hide_window(self):
         self.root.withdraw()
@@ -2485,6 +3187,166 @@ class ControlPanel:
             save_config(config)
         except Exception:
             pass
+
+    # ---------- 吸边隐藏 ----------
+    def _apply_window_level(self):
+        """主窗口不再使用置顶功能。吸边唤出态仅 lift 抬到前面，不抢层级。"""
+        try:
+            if config.get("edge_hide", False) and self._edge_state == 'shown':
+                self.root.lift()
+        except Exception:
+            pass
+
+    def _on_drag_drop(self):
+        """拖拽松手回调：保存位置，并按吸边开关决定进入隐藏/自由态。"""
+        self._save_position()
+        if not config.get("edge_hide", False):
+            self._apply_window_level()
+            return
+        # 跟随窗口当前所在显示器判定贴边（多屏）
+        mon = _monitor_rect(self.root)
+        try:
+            ww = self.root.winfo_width()
+            x = self.root.winfo_x()
+        except Exception:
+            return
+        if mon:
+            mx, _, mw, _ = mon
+        else:
+            mx, mw = 0, self.root.winfo_screenwidth()
+        self._snap_mon = mon
+        if x <= mx + 2:
+            self._snap_edge = 'left'
+            self._enter_hidden()
+        elif x >= mx + mw - ww - 2:
+            self._snap_edge = 'right'
+            self._enter_hidden()
+        else:
+            self._enter_free()
+
+    def _enter_free(self):
+        self._edge_state = 'free'
+        self._snap_edge = None
+        self._hide_reveal_strip()
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except Exception:
+            pass
+        self._apply_window_level()
+
+    def _enter_hidden(self):
+        try:
+            self._hidden_geo = (self.root.winfo_x(), self.root.winfo_y(),
+                                self.root.winfo_width(), self.root.winfo_height())
+        except Exception:
+            self._hidden_geo = None
+        self._edge_state = 'hidden'
+        self.root.withdraw()
+        self._show_reveal_strip()
+
+    def _show_reveal_strip(self):
+        mon = getattr(self, '_snap_mon', None) or _monitor_rect(self.root)
+        if mon:
+            mx, _, mw, _ = mon
+        else:
+            mx, mw = 0, self.root.winfo_screenwidth()
+        if self._hidden_geo:
+            _, gy, _, gh = self._hidden_geo
+        else:
+            gy, gh = 80, self.HEIGHT
+        sx = mx if self._snap_edge == 'left' else mx + mw - self._strip_w
+        if self._reveal_strip is None or not self._reveal_strip.winfo_exists():
+            strip = tk.Toplevel(self.root)
+            strip.overrideredirect(True)
+            strip.attributes('-topmost', True)
+            cv = tk.Canvas(strip, width=self._strip_w, height=gh,
+                           highlightthickness=0, bd=0)
+            cv.pack(fill='both', expand=True)
+            strip.bind('<Enter>', lambda e: self._reveal())
+            cv.bind('<Enter>', lambda e: self._reveal())
+            self._reveal_strip = strip
+            self._reveal_canvas = cv
+        self._reveal_strip.geometry(f'{self._strip_w}x{gh}+{sx}+{gy}')
+        self._reveal_strip.deiconify()
+        self._refresh_reveal_strip()
+
+    def _refresh_reveal_strip(self):
+        """露出条按高度从下往上填充当前任务进度。"""
+        if self._edge_state != 'hidden' or self._reveal_strip is None:
+            return
+        try:
+            if not self._reveal_strip.winfo_exists():
+                return
+            t = self.theme()
+            cv = self._reveal_canvas
+            h = self._reveal_strip.winfo_height() or self.HEIGHT
+            w = self._strip_w
+            _, progress = self._compute_tick_state()
+            progress = max(0.0, min(1.0, progress))
+            cv.delete('all')
+            # 与计时页刻度同义：未完成=淡黄(cream #FFF8DC)底，已完成=青绿（从下往上填充）
+            cv.configure(bg=t["cream"])
+            cv.create_rectangle(0, 0, w, h, fill=t["cream"], outline=t["black"])
+            fill_h = int(h * progress)
+            if fill_h > 0:
+                cv.create_rectangle(0, h - fill_h, w, h, fill=t["teal"], outline='')
+        except Exception:
+            pass
+
+    def _reveal(self):
+        if self._edge_state == 'shown':
+            return
+        mon = getattr(self, '_snap_mon', None) or _monitor_rect(self.root)
+        if mon:
+            mx, _, mw, _ = mon
+        else:
+            mx, mw = 0, self.root.winfo_screenwidth()
+        if self._hidden_geo:
+            _, gy, gw, gh = self._hidden_geo
+        else:
+            gy, gw, gh = 80, self.WIDTH, self.HEIGHT
+        x = mx if self._snap_edge == 'left' else mx + mw - gw
+        self._edge_state = 'shown'
+        self._hide_reveal_strip()
+        try:
+            self.root.deiconify()
+            self.root.geometry(f'{gw}x{gh}+{x}+{gy}')
+            self.root.lift()
+        except Exception:
+            pass
+
+    def _on_root_leave(self, event=None):
+        if self._edge_state != 'shown' or not config.get("edge_hide", False):
+            return
+        # 左键按住=正在拖动，不收起
+        if event is not None and (event.state & 0x0100):
+            return
+        # 鼠标移到子控件也会触发 <Leave>，用指针坐标判断是否真的离开窗口
+        try:
+            px, py = self.root.winfo_pointerx(), self.root.winfo_pointery()
+            x0, y0 = self.root.winfo_rootx(), self.root.winfo_rooty()
+            x1 = x0 + self.root.winfo_width()
+            y1 = y0 + self.root.winfo_height()
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                return
+        except Exception:
+            pass
+        self._collapse()
+
+    def _collapse(self):
+        if self._edge_state != 'shown':
+            return
+        self._edge_state = 'hidden'
+        self.root.withdraw()
+        self._show_reveal_strip()
+
+    def _hide_reveal_strip(self):
+        if self._reveal_strip is not None:
+            try:
+                self._reveal_strip.withdraw()
+            except Exception:
+                pass
 
     def _build_ui(self):
         t = self.theme()
@@ -2525,7 +3387,6 @@ class ControlPanel:
                       font=('JetBrains Mono', 14, 'bold'), tags='dynamic')
         for x, color in ((298, t["black"]), (307, t["black"]), (316, t["red"])):
             c.create_rectangle(x, 20, x + 5, 25, fill=color, outline='', tags=('dynamic', 'menu_dots'))
-        c.tag_bind('menu_dots', '<Button-1>', self._toggle_menu)
         c.tag_bind('menu_dots', '<Enter>', lambda e: c.config(cursor='hand2'))
         c.tag_bind('menu_dots', '<Leave>', lambda e: c.config(cursor='fleur'))
 
@@ -2583,7 +3444,7 @@ class ControlPanel:
                 c.create_rectangle(x + 2, y0 + 2, x + w - 2, y0 + h - 2,
                                    fill=t["teal"], outline='', tags='dynamic')
             elif is_current:
-                c.create_rectangle(x, y0, x + w, y0 + h, fill=cursor_color, outline='', tags='dynamic')
+                c.create_rectangle(x, y0, x + w, y0 + h, fill=cursor_color, outline='', tags=('dynamic', 'cursor_cell'))
             else:
                 c.create_rectangle(x, y0 + 3, x + w, y0 + h - 3,
                                    fill=self._blend(t["white"], t["black"], 0.33), outline='', tags='dynamic')
@@ -2630,8 +3491,8 @@ class ControlPanel:
                       font=('Microsoft YaHei', 10, 'bold'), tags='dynamic')
 
     def _bind_drag(self):
-        _bind_full_drag(self.root, self.root, self.panel, on_snap_save=self._save_position)
-        _bind_full_drag(self.root, self.root, self.canvas, on_snap_save=self._save_position)
+        _bind_full_drag(self.root, self.root, self.panel, on_snap_save=self._on_drag_drop)
+        _bind_full_drag(self.root, self.root, self.canvas, on_snap_save=self._on_drag_drop)
 
     def _toggle_menu(self, event=None):
         if self._menu_window is not None and self._menu_window.winfo_exists():
@@ -2642,8 +3503,8 @@ class ControlPanel:
     def _show_menu(self):
         t = self.theme()
         m = tk.Toplevel(self.root)
+        m.withdraw()
         m.overrideredirect(True)
-        m.attributes('-topmost', True)
         m.configure(bg=t["white"])
 
         bd = tk.Frame(m, bg=t["white"], highlightthickness=3, highlightbackground=t["black"])
@@ -2685,14 +3546,32 @@ class ControlPanel:
 
         self.root.update_idletasks()
         m.update_idletasks()
-        rx = self.root.winfo_x() + self.WIDTH - 146
-        ry = self.root.winfo_y() + 38
+        # 用 canvas 的绝对屏幕坐标定位（overrideredirect 主窗 winfo_x 在多屏下不可靠），
+        # 让下拉菜单出现在右上角三个点正下方
+        try:
+            cx = self.canvas.winfo_rootx()
+            cy = self.canvas.winfo_rooty()
+        except Exception:
+            cx = self.root.winfo_x()
+            cy = self.root.winfo_y()
+        rx = cx + self.WIDTH - 146
+        ry = cy + 38
         total_h = bd.winfo_reqheight() + 8
+        vs = _virtual_screen()
+        if vs:
+            vx, vy, vw, vh = vs
+            rx = max(vx, min(rx, vx + vw - 146))
+            ry = max(vy, min(ry, vy + vh - total_h))
+        m.geometry(f'146x{total_h}+{rx}+{ry}')
+        m.deiconify()
+        m.update_idletasks()
+        # overrideredirect 窗口首次映射常忽略位置落到 (0,0)，映射后再设一次才稳
         m.geometry(f'146x{total_h}+{rx}+{ry}')
 
         self._menu_window = m
         m.bind('<FocusOut>', lambda e: self._close_menu())
         m.focus_set()
+        _win_set_topmost(m, True)
 
     def _close_menu(self):
         try:
@@ -2732,7 +3611,10 @@ class ControlPanel:
         self.tracker.reminder_interval = config["reminder_interval"]
         self.tracker.lock_check_interval = config["lock_check_interval"]
         self.tracker.no_input_threshold = config.get("no_input_threshold", 180)
-        self.root.attributes('-topmost', config.get("always_on_top", True))
+        if not config.get("edge_hide", False) and self._edge_state != 'free':
+            self._enter_free()
+        else:
+            self._apply_window_level()
         self._render_static()
 
     def _open_stats(self):
@@ -2812,6 +3694,8 @@ class ControlPanel:
             self.tray.update_tooltip(
                 f"W/TRACE · {self.tracker.current_task.name if self.tracker.current_task else 'idle'}"
             )
+            if self._edge_state == 'hidden':
+                self._refresh_reveal_strip()
         except Exception as e:
             print(f"刷新错误: {e}")
         self.root.after(1000, self._update_loop)
@@ -2826,17 +3710,26 @@ class ControlPanel:
 
     def _pulse_loop(self):
         try:
-            self._tick_pulse_phase += 0.018 * self._tick_pulse_dir
+            self._tick_pulse_phase += 0.033 * self._tick_pulse_dir
             if self._tick_pulse_phase >= 1.0:
                 self._tick_pulse_phase = 1.0
                 self._tick_pulse_dir = -1
             elif self._tick_pulse_phase <= 0.0:
                 self._tick_pulse_phase = 0.0
                 self._tick_pulse_dir = 1
-            self._render_static()
+            self._update_cursor_color()
         except Exception:
             pass
-        self.root.after(45, self._pulse_loop)
+        self.root.after(33, self._pulse_loop)
+
+    def _update_cursor_color(self):
+        t = self.theme()
+        ease = 0.5 - 0.5 * math.cos(math.pi * self._tick_pulse_phase)
+        color = self._blend(t["white"], t["yellow"], 0.55 + 0.45 * ease)
+        try:
+            self.canvas.itemconfigure('cursor_cell', fill=color)
+        except Exception:
+            pass
 
     def _blend(self, hex1, hex2, t_):
         def to_rgb(h):
@@ -2889,7 +3782,12 @@ class TimeTracker:
         self.current_task_history_seconds = 0  # 当前任务在今日的历史累计专注秒数
         self.today_no_input_seconds = 0        # 今日实际无操作秒数（连续3分钟以上无输入）
         self.is_deviating = False              # 当前是否处于偏离状态（焦点窗口与任务不一致）
-    
+        # AI 内容感知偏离判定
+        self.ai_enabled = config.get("ai_enabled", True)
+        self.body_send = config.get("body_send", True)
+        self.ark = ArkClient(config)
+        self._last_relation = 'related'        # 最近一次判定结果（供 UI/日志）
+
     def start(self):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 时间追踪已启动")
         self.running = True
@@ -2937,6 +3835,8 @@ class TimeTracker:
         window_info = WindowTracker.get_active_window_info()
         options = [task.name for task in self.today_tasks]
         task_ids = [task.id for task in self.today_tasks]
+        # 休息/娱乐放最后一项（idx>=len(task_ids)，自动不带改/删按钮，也不会成为默认选中行）
+        options.append("休息/娱乐")
         msg = "请选择你现在要做的任务："
         dialog = ModernDialog(self.panel.root, "选择任务", msg, options,
                              task_ids=task_ids,
@@ -3065,20 +3965,20 @@ class TimeTracker:
                 if self._is_window_changed(window_info):
                     self._handle_window_change(window_info)
 
-                # 任务偏离提醒：有当前任务但焦点窗口与任务不一致
+                # 任务偏离提醒：内容感知判定，只有 drift 才计入偏离计时
                 if self.current_task and self.current_activity and self.running:
-                    if not self._is_same_task_context(window_info):
-                        # 焦点窗口与当前任务不一致
+                    relation = self._classify_context(window_info)
+                    if relation == 'drift':
                         self.is_deviating = True
                         if self.deviation_start_time == 0:
                             self.deviation_start_time = time.time()
                         elif time.time() - self.deviation_start_time >= self.reminder_interval:
-                            # 超过偏离阈值，弹窗确认
+                            # 偏离持续超过容忍阈值，弹窗确认
                             self.deviation_start_time = 0
                             self.last_reminder_time = time.time()
                             self._ask_task_confirmation(window_info)
                     else:
-                        # 焦点窗口恢复一致，重置偏离计时
+                        # related 或 maybe_drift：视为在容忍范围内，重置偏离计时
                         self.deviation_start_time = 0
                         self.is_deviating = False
                 else:
@@ -3129,16 +4029,88 @@ class TimeTracker:
         if not self.current_task:
             self._ask_for_task(window_info)
             return
-        
-        if self._is_same_task_context(window_info):
-            if self.current_activity:
-                self.current_activity.app_name = window_info['app']
-                self.current_activity.window_title = window_info['title']
-                self.current_activity.url = window_info['url']
-            return
-        
-        self._ask_task_confirmation(window_info)
+
+        # 有当前任务时，窗口变化只更新活动记录的窗口信息；
+        # 是否偏离、何时弹窗，统一交给 _track_loop 里带「偏离容忍」计时的判定，
+        # 不在此处立即弹窗（否则一换应用就弹，绕过了容忍时长）。
+        if self.current_activity:
+            self.current_activity.app_name = window_info['app']
+            self.current_activity.window_title = window_info['title']
+            self.current_activity.url = window_info.get('url', '')
     
+    def _classify_context(self, window_info: Dict[str, str]) -> str:
+        """内容感知偏离判定，返回 'related' | 'maybe_drift' | 'drift'。
+        流程：抓正文/网址 → 火山 AI 判定；AI 关闭或失败时降级为进程名启发式。"""
+        # 降级路径：AI 关闭或不可用
+        if not self.ai_enabled or not self.ark.available():
+            return 'related' if self._is_same_task_context(window_info) else 'drift'
+
+        # 抓取当前窗口内容（网址 + 正文摘要），失败返回空、不抛异常
+        url, body = '', ''
+        try:
+            hwnd = win32gui.GetForegroundWindow() if HAS_WIN32 else 0
+            content = ContentReader.read(hwnd, window_info.get('app', ''),
+                                         want_body=self.body_send)
+            url = content.get('url', '')
+            body = content.get('body', '')
+            window_info['url'] = url  # 顺带回填活动记录用的 url 字段
+        except Exception as e:
+            print(f"[偏离判定] 内容抓取异常: {e}")
+
+        keywords = getattr(self.current_task, 'keywords', '') or ''
+        title = window_info.get('title', '')
+        self._last_grab = {'title': title, 'body': body, 'url': url}
+
+        # 本地关键词预筛：命中足够多高权重关键词直接判 related，跳过 AI（省 token/延迟）
+        if self._keyword_prefilter(title, url, body) == 'related':
+            self._last_relation = 'related'
+            self._learn_keywords(title, body)
+            return 'related'
+
+        res = self.ark.classify(
+            self.current_task.name, keywords,
+            window_info.get('app', ''), title,
+            url, body)
+        if res is None:
+            # AI 失败：降级到进程名启发式，避免误弹
+            return 'related' if self._is_same_task_context(window_info) else 'maybe_drift'
+
+        relation, reason = res
+        self._last_relation = relation
+        if relation == 'drift':
+            print(f"[偏离判定] drift: {reason}")
+        else:
+            # related / maybe_drift 视为在做，强化关键词画像
+            self._learn_keywords(title, body)
+        return relation
+
+    def _keyword_prefilter(self, title, url, body):
+        """内容命中当前任务 >=2 个已学习关键词时判定 related，否则返回 None 交给 AI。
+        只做正向短路（related），绝不本地判 drift，避免误弹。"""
+        kw = (getattr(self.current_task, 'keywords', '') or '')
+        kws = [k for k in kw.split(',') if k]
+        if len(kws) < 2:
+            return None
+        hay = f"{title} {url} {body}".lower()
+        hits = sum(1 for k in kws if k.lower() in hay)
+        return 'related' if hits >= 2 else None
+
+    def _learn_keywords(self, title, body):
+        """内容被确认在做时，从标题+正文摘要抽词累加权重；周期性回写 keywords 字段。"""
+        if not self.current_task:
+            return
+        try:
+            terms = extract_terms(f"{title} {(body or '')[:200]}", limit=60)
+            if not terms:
+                return
+            self.db.bump_keywords(self.current_task.id, terms)
+            self._learn_count = getattr(self, '_learn_count', 0) + 1
+            if self._learn_count % 5 == 0:
+                kw = self.db.sync_task_keywords_field(self.current_task.id)
+                self.current_task.keywords = kw
+        except Exception as e:
+            print(f"[关键词学习] {e}")
+
     def _is_same_task_context(self, window_info: Dict[str, str]) -> bool:
         """判断当前焦点窗口是否与进行中的任务属于同一上下文。
         严格匹配：只有同一个应用进程才视为同一上下文。
@@ -3163,6 +4135,8 @@ class TimeTracker:
             try:
                 options = [task.name for task in self.today_tasks]
                 task_ids = [task.id for task in self.today_tasks]
+                # 休息/娱乐放最后一项（idx>=len(task_ids)，自动不带改/删按钮）
+                options.append("休息/娱乐")
                 msg = f"检测到你在使用：{window_info.get('app', '')} - {window_info.get('title', '')}\n\n请选择当前任务，或在下方输入新建："
 
                 dialog = ModernDialog(self.panel.root, "任务确认", msg, options,
@@ -3199,8 +4173,10 @@ class TimeTracker:
                 options = [
                     f"✅ 仍在做：{self.current_task.name}",
                     "🔄 切换到其他任务",
-                    "休息/娱乐"
                 ]
+                # 休息状态下「仍在做：休息/娱乐」已覆盖，不再重复追加「休息/娱乐」
+                if self.current_task.id != 'rest':
+                    options.append("休息/娱乐")
 
                 dialog = ModernDialog(
                     self.panel.root,
@@ -3211,6 +4187,10 @@ class TimeTracker:
                 result = dialog.show()
 
                 if result and result.startswith("✅"):
+                    # 用户确认仍在做：强信号，强化当前内容的关键词画像
+                    grab = getattr(self, '_last_grab', None)
+                    if grab:
+                        self._learn_keywords(grab.get('title', ''), grab.get('body', ''))
                     self._end_activity()
                     self._start_activity(self.current_task, window_info)
                 elif result and result.startswith("🔄"):
@@ -3220,7 +4200,8 @@ class TimeTracker:
                     return
                 elif result == "休息/娱乐" or result == "REST":
                     self._end_activity()
-                    self.current_task = None
+                    self.current_task = Task(id='rest', name='休息/娱乐')
+                    self._start_activity(self.current_task, window_info)
             finally:
                 self._dialog_active = False
 
@@ -3240,7 +4221,7 @@ class TimeTracker:
         if not result:
             return
 
-        if result == "REST":
+        if result == "REST" or result == "休息/娱乐":
             self.current_task = Task(id='rest', name='休息/娱乐')
             self._start_activity(self.current_task, window_info)
         elif result.startswith("NEW:"):
