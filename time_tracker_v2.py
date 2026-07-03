@@ -49,6 +49,122 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "time_tracker.db")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
+# ========== DPI 缩放 ==========
+# 全局 UI 缩放系数。1.0 = 100%(96 DPI，界面像素值的设计基准)。
+# 混合 DPI 多屏下按窗口所在显示器的真实 DPI 计算，运行时可变。
+_SCALE = 1.0
+
+
+def _enable_dpi_awareness():
+    """在创建任何 Tk 窗口之前声明进程 DPI 感知(Per-Monitor V2)。
+    否则 Windows 会对本进程做整体位图拉伸，跨不同 DPI 屏就会发虚/错乱。
+    逐级降级：Per-Monitor V2 → Per-Monitor → System。"""
+    if sys.platform != 'win32':
+        return
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4 (Win10 1703+)
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_dpi_awareness()
+
+
+def _S(v):
+    """把设计基准(96 DPI)下的像素值按当前 UI 缩放系数换算成物理像素。"""
+    try:
+        return int(round(v * _SCALE))
+    except Exception:
+        return v
+
+
+def _dpi_scale_for_point(x, y):
+    """返回坐标 (x, y) 所在显示器的 DPI 缩放系数(如 225% → 2.25)。失败返回 1.0。"""
+    if sys.platform != 'win32':
+        return 1.0
+    try:
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        user32 = ctypes.windll.user32
+        shcore = ctypes.windll.shcore
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.MonitorFromPoint.argtypes = [POINT, ctypes.c_uint]
+        MONITOR_DEFAULTTONEAREST = 2
+        hmon = user32.MonitorFromPoint(POINT(int(x), int(y)), MONITOR_DEFAULTTONEAREST)
+        dpi_x = ctypes.c_uint()
+        dpi_y = ctypes.c_uint()
+        MDT_EFFECTIVE_DPI = 0
+        shcore.GetDpiForMonitor(ctypes.c_void_p(hmon), MDT_EFFECTIVE_DPI,
+                                ctypes.byref(dpi_x), ctypes.byref(dpi_y))
+        if dpi_x.value > 0:
+            return dpi_x.value / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def _apply_ui_scale(root, x, y):
+    """按坐标 (x, y) 所在屏 DPI 设定全局缩放系数，并让 Tk 缩放点号字体。
+    返回本次生效的缩放系数。"""
+    global _SCALE
+    s = _dpi_scale_for_point(x, y)
+    _SCALE = s if s and s > 0 else 1.0
+    try:
+        # tk scaling = 每点像素数 = DPI / 72 = _SCALE * 96 / 72
+        root.tk.call('tk', 'scaling', _SCALE * 96.0 / 72.0)
+    except Exception:
+        pass
+    return _SCALE
+
+
+class ScaledCanvas(tk.Canvas):
+    """自动按 _SCALE 缩放的 Canvas：构造时缩放 width/height，绘制时缩放所有
+    坐标与 width/height 选项。这样画布内所有 create_* 的像素坐标无需逐行改。"""
+
+    def __init__(self, master=None, **kw):
+        for key in ('width', 'height'):
+            if key in kw and isinstance(kw[key], (int, float)):
+                kw[key] = _S(kw[key])
+        super().__init__(master, **kw)
+
+    @staticmethod
+    def _scale_coord(v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return _S(v)
+        if isinstance(v, (list, tuple)):
+            return type(v)(ScaledCanvas._scale_coord(i) for i in v)
+        return v
+
+    def _create(self, itemType, args, kw):
+        if args and isinstance(args[-1], dict):
+            coords = args[:-1]
+            cnf = args[-1]
+        else:
+            coords = args
+            cnf = None
+        coords = tuple(ScaledCanvas._scale_coord(c) for c in coords)
+        for d in (kw, cnf):
+            if d:
+                for key in ('width', 'height'):
+                    if key in d and isinstance(d[key], (int, float)) and not isinstance(d[key], bool):
+                        d[key] = _S(d[key])
+        args = coords + ((cnf,) if cnf is not None else ())
+        return super()._create(itemType, args, kw)
+
 # 修复 Windows 控制台编码，并兼容 pythonw.exe 无控制台启动
 if sys.platform == 'win32':
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worktrace_start.log")
@@ -383,6 +499,7 @@ class Task:
     color: str = "#4A90E2"
     created_at: str = ""
     keywords: str = ""   # 逗号分隔的关键词画像（自动学习累积）
+    description: str = ""  # 任务描述（可选，用户填写。给 AI 判定作上下文）
     
 @dataclass
 class Activity:
@@ -463,10 +580,12 @@ class Database:
             )
         ''')
 
-        # 迁移：为老库的 tasks 表补 keywords 列
+        # 迁移：为老库的 tasks 表补 keywords / description 列
         cols = [r[1] for r in cursor.execute("PRAGMA table_info(tasks)").fetchall()]
         if 'keywords' not in cols:
             cursor.execute("ALTER TABLE tasks ADD COLUMN keywords TEXT DEFAULT ''")
+        if 'description' not in cols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN description TEXT DEFAULT ''")
 
         conn.commit()
         conn.close()
@@ -475,10 +594,11 @@ class Database:
         conn = self.get_conn()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO tasks (id, name, color, created_at, is_active, keywords)
-            VALUES (?, ?, ?, ?, 1, ?)
+            INSERT OR REPLACE INTO tasks (id, name, color, created_at, is_active, keywords, description)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
         ''', (task.id, task.name, task.color, task.created_at or datetime.now().isoformat(),
-              getattr(task, 'keywords', '') or ''))
+              getattr(task, 'keywords', '') or '',
+              getattr(task, 'description', '') or ''))
         conn.commit()
         conn.close()
     
@@ -495,13 +615,32 @@ class Database:
         cursor.execute('UPDATE tasks SET name = ? WHERE id = ?', (new_name, task_id))
         conn.commit()
         conn.close()
+
+    def update_task_description(self, task_id: str, description: str):
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE tasks SET description = ? WHERE id = ?', (description or '', task_id))
+        conn.commit()
+        conn.close()
+
+    def delete_task_keyword(self, task_id: str, term: str):
+        """从权重表删掉单个关键词，并回写 tasks.keywords。"""
+        if not task_id or not term:
+            return
+        conn = self.get_conn()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM task_keywords WHERE task_id = ? AND term = ?",
+                       (task_id, term))
+        conn.commit()
+        conn.close()
+        self.sync_task_keywords_field(task_id)
     
     def get_tasks(self) -> List[Task]:
         conn = self.get_conn()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, color, created_at, COALESCE(keywords, '') "
+        cursor.execute("SELECT id, name, color, created_at, COALESCE(keywords, ''), COALESCE(description, '') "
                        "FROM tasks WHERE is_active = 1 ORDER BY created_at")
-        tasks = [Task(id=r[0], name=r[1], color=r[2], created_at=r[3], keywords=r[4])
+        tasks = [Task(id=r[0], name=r[1], color=r[2], created_at=r[3], keywords=r[4], description=r[5])
                  for r in cursor.fetchall()]
         conn.close()
         return tasks
@@ -862,7 +1001,7 @@ class ArkClient:
     def available(self):
         return bool(self.api_key and self.endpoint and self.model)
 
-    def classify(self, task_name, keywords, app, title, url, body):
+    def classify(self, task_name, keywords, app, title, url, body, description=''):
         if not self.available():
             return None
         key = f"{task_name}|{app}|{url}|{title}|{(body or '')[:80]}"
@@ -871,11 +1010,23 @@ class ArkClient:
         if hit and now - hit[0] < self._cache_ttl:
             return (hit[1], hit[2])
 
-        sysmsg = ('你是工作偏离判定器。只输出一个 JSON：'
-                  '{"relation":"related|maybe_drift|drift","reason":"一句话中文"}。不要输出多余内容。')
+        sysmsg = (
+            "你是工作偏离判定器。判断用户当前浏览的内容是否在做他声明的任务。\n"
+            "三类定义：\n"
+            "- related：内容和任务直接相关，或明显是完成任务所需的辅助信息。"
+            "包括：查资料、看规范/文档、看竞品、和同事讨论该任务、参考同方向的教程/案例。\n"
+            "- drift：内容和该任务无关。哪怕是工作性质但与当前任务无关，也算 drift。"
+            "娱乐、社交、私事一律算 drift。\n"
+            "- maybe_drift：仅用于\"无法确定\"。信息不足、内容模糊、抓不到正文等情况归此。\n"
+            "判定倾向：宁漏勿误。用户不想被打扰，拿不准时归 maybe_drift，不要归 drift。\n"
+            "只输出严格 JSON：{\"relation\":\"related|maybe_drift|drift\",\"reason\":\"一句话中文\"}。"
+            "不要输出多余内容。"
+        )
         parts = [f"任务: {task_name}"]
+        if description:
+            parts.append(f"任务描述: {description}")
         if keywords:
-            parts.append(f"关键词: {keywords}")
+            parts.append(f"已学习关键词: {keywords}")
         cur = f"当前: 进程={app} 标题={title}"
         if url:
             cur += f" 网址={url}"
@@ -1108,7 +1259,7 @@ def _bind_full_drag(win, *widgets, on_snap_save=None):
     """给窗口的所有指定 widget 绑定整窗拖拽 + 边缘磁吸（20px）。
     按钮（cursor='hand2'）和输入框不参与拖拽。
     on_snap_save: 磁吸后可选回调（如保存位置）。"""
-    SNAP = 20
+    SNAP = _S(20)
 
     def _start(e):
         w = e.widget
@@ -1173,7 +1324,7 @@ def _bind_title_drag(win, *widgets, on_snap_save=None):
     """仅让指定的标题栏 widget（及其子树）可拖动窗口，内容区不参与拖拽。
     跳过按钮（cursor='hand2'）和输入框。用于设置/统计/任务列表等含交互控件的面板，
     避免拖动滑块/内容时误拖窗口。全局统一：面板一律标题栏拖拽。"""
-    SNAP = 20
+    SNAP = _S(20)
 
     def _start(e):
         w = e.widget
@@ -1298,19 +1449,16 @@ class ModernDialog:
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        w = 480
-        row_h = 47
+        w = _S(480)
+        row_h = _S(47)
         max_visible_rows = 8
         visible_rows = min(max(len(self.options), 3), max_visible_rows)
-        # 给选项区固定可见高度（满行，不再被估算的 chrome 高度反向挤压）；
-        # 行数超过可见上限才滚动。窗口最终高度在 _finalize_size 里按实测内容决定，
-        # 避免估算 chrome 偏小导致最底行被裁切。
-        self._options_area_h = max(111, visible_rows * row_h)
+        self._options_area_h = max(_S(111), visible_rows * row_h)
         self._needs_option_scroll = len(self.options) > max_visible_rows
         self._dialog_w = w
-        self._dialog_max_h = sh - 80
+        self._dialog_max_h = sh - _S(80)
         self._dialog_parent = parent
-        _place_centered(self.root, parent, w, 420)
+        _place_centered(self.root, parent, w, _S(420))
 
         self._create_ui(title)
         self._finalize_size()
@@ -1319,8 +1467,8 @@ class ModernDialog:
         """按实测内容高度确定窗口高度，避免估算 chrome 偏差导致最底行被裁切。"""
         try:
             self.root.update_idletasks()
-            req_h = self.bd.winfo_reqheight() + 18
-            h = max(350, min(req_h, self._dialog_max_h))
+            req_h = self.bd.winfo_reqheight() + _S(18)
+            h = max(_S(350), min(req_h, self._dialog_max_h))
             _place_centered(self.root, self._dialog_parent, self._dialog_w, h)
         except Exception:
             pass
@@ -1334,23 +1482,23 @@ class ModernDialog:
         inner = tk.Frame(self.bd, bg=t["cream"])
         inner.pack(fill='both', expand=True)
 
-        self._scanline_canvas = tk.Canvas(inner, bg=t["cream"], highlightthickness=0, bd=0)
+        self._scanline_canvas = ScaledCanvas(inner, bg=t["cream"], highlightthickness=0, bd=0)
         self._scanline_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._draw_scanline()
 
         hdr = tk.Frame(inner, bg=t["yellow"])
         hdr.pack(fill='x')
 
-        title_box = tk.Frame(hdr, bg=t["yellow"], padx=12, pady=10)
+        title_box = tk.Frame(hdr, bg=t["yellow"], padx=_S(12), pady=_S(10))
         title_box.pack(side='left', fill='x', expand=True)
-        rv = tk.Canvas(title_box, width=12, height=12, bg=t["yellow"], highlightthickness=0, bd=0)
-        rv.pack(side='left', padx=(0, 8))
+        rv = ScaledCanvas(title_box, width=12, height=12, bg=t["yellow"], highlightthickness=0, bd=0)
+        rv.pack(side='left', padx=(_S(0), _S(8)))
         rv.create_oval(1, 1, 11, 11, fill=t["black"], outline='')
 
         tk.Label(title_box, text="选择任务",
                  font=('Microsoft YaHei', 13, 'bold'),
                  bg=t["yellow"], fg=t["black"], anchor='w',
-                 cursor='fleur').pack(side='left', padx=(4, 0))
+                 cursor='fleur').pack(side='left', padx=(_S(4), _S(0)))
 
         close_lbl = tk.Label(hdr, text="×",
                              font=('JetBrains Mono', 13, 'bold'),
@@ -1360,20 +1508,20 @@ class ModernDialog:
         close_lbl.bind('<Enter>', lambda e: close_lbl.config(bg=t["black"], fg=t["yellow"]))
         close_lbl.bind('<Leave>', lambda e: close_lbl.config(bg=t["red"], fg=t["white"]))
 
-        tk.Frame(inner, bg=t["black"], height=4).pack(fill='x')
+        tk.Frame(inner, bg=t["black"], height=_S(4)).pack(fill='x')
 
         app, win_title = self._parse_context()
         guide = tk.Frame(inner, bg=t["cream"])
-        guide.pack(fill='x', padx=14, pady=(10, 6))
+        guide.pack(fill='x', padx=_S(14), pady=(_S(10), _S(6)))
         tk.Label(guide, text="已检测到当前应用与窗口",
                  font=('Microsoft YaHei', 9, 'bold'),
                  bg=t["cream"], fg=t["black"], anchor='w').pack(fill='x')
 
         readout = tk.Frame(inner, bg=t["cream"], highlightthickness=3,
                            highlightbackground=t["black"])
-        readout.pack(fill='x', padx=14, pady=(0, 6))
+        readout.pack(fill='x', padx=_S(14), pady=(_S(0), _S(6)))
 
-        top = tk.Frame(readout, bg=t["cream"], padx=10, pady=7)
+        top = tk.Frame(readout, bg=t["cream"], padx=_S(10), pady=_S(7))
         top.pack(fill='x')
         tk.Label(top, text="APP",
                  font=('JetBrains Mono', 8, 'bold'),
@@ -1382,24 +1530,24 @@ class ModernDialog:
                  font=('Microsoft YaHei', 9, 'bold'),
                  bg=t["cream"], fg=t["black"], anchor='w').pack(side='left', fill='x', expand=True)
 
-        bottom = tk.Frame(readout, bg=t["cream"], padx=10)
-        bottom.pack(fill='x', pady=(0, 7))
+        bottom = tk.Frame(readout, bg=t["cream"], padx=_S(10))
+        bottom.pack(fill='x', pady=(_S(0), _S(7)))
         tk.Label(bottom, text="窗口 · " + (win_title[:46] or title),
                  font=('Microsoft YaHei', 9, 'bold'),
                  bg=t["cream"], fg=t["muted"], anchor='w').pack(fill='x')
 
         tk.Label(inner, text="请选择要切换的任务，或在下方创建新任务。双击任务，或选中后按 Enter 确认。",
                  font=('Microsoft YaHei', 8, 'bold'),
-                 bg=t["cream"], fg=t["black"], anchor='w').pack(fill='x', padx=14, pady=(0, 8))
+                 bg=t["cream"], fg=t["black"], anchor='w').pack(fill='x', padx=_S(14), pady=(_S(0), _S(8)))
 
         options_shell = tk.Frame(inner, bg=t["cream"])
-        options_shell.pack(fill='x', padx=14)
+        options_shell.pack(fill='x', padx=_S(14))
 
         if self._needs_option_scroll:
             # 任务多于可见上限：固定可视高度 + 滚动条
             options_shell.configure(height=self._options_area_h)
             options_shell.pack_propagate(False)
-            options_canvas = tk.Canvas(options_shell, bg=t["cream"],
+            options_canvas = ScaledCanvas(options_shell, bg=t["cream"],
                                        highlightthickness=0, bd=0)
             options_scroll = CyberScrollbar(options_shell, options_canvas.yview)
             options_wrap = tk.Frame(options_canvas, bg=t["cream"])
@@ -1407,9 +1555,9 @@ class ModernDialog:
                               lambda e: options_canvas.configure(scrollregion=options_canvas.bbox('all')))
             self._options_window = options_canvas.create_window((0, 0), window=options_wrap, anchor='nw', width=418)
             options_canvas.configure(yscrollcommand=options_scroll.set)
-            options_canvas.bind('<Configure>', lambda e: options_canvas.itemconfigure(self._options_window, width=e.width - 12))
+            options_canvas.bind('<Configure>', lambda e: options_canvas.itemconfigure(self._options_window, width=e.width - _S(12)))
             options_canvas.pack(side='left', fill='both', expand=True)
-            options_scroll.pack(side='right', fill='y', padx=(4, 0))
+            options_scroll.pack(side='right', fill='y', padx=(_S(4), _S(0)))
             options_canvas.bind('<MouseWheel>', self._on_options_mousewheel)
             options_wrap.bind('<MouseWheel>', self._on_options_mousewheel)
             self._options_canvas = options_canvas
@@ -1429,16 +1577,16 @@ class ModernDialog:
         else:
             empty = tk.Frame(options_wrap, bg=t["cream"], highlightthickness=3,
                              highlightbackground=t["black"])
-            empty.pack(fill='x', pady=(0, 8))
+            empty.pack(fill='x', pady=(_S(0), _S(8)))
             tk.Label(empty, text="NO TASKS · ADD BELOW",
                      font=('JetBrains Mono', 10, 'bold'),
-                     bg=t["cream"], fg=t["red"]).pack(pady=15)
+                     bg=t["cream"], fg=t["red"]).pack(pady=_S(15))
 
         self.input_wrap = tk.Frame(inner, bg=t["cream"], highlightthickness=3,
                                    highlightbackground=t["black"])
-        self.input_wrap.pack(fill='x', padx=14, pady=(8, 0))
+        self.input_wrap.pack(fill='x', padx=_S(14), pady=(_S(8), _S(0)))
 
-        input_row = tk.Frame(self.input_wrap, bg=t["cream"], padx=10, pady=7)
+        input_row = tk.Frame(self.input_wrap, bg=t["cream"], padx=_S(10), pady=_S(7))
         input_row.pack(fill='x')
         tk.Label(input_row, text=">",
                  font=('JetBrains Mono', 11, 'bold'),
@@ -1448,7 +1596,7 @@ class ModernDialog:
                               bg=t["cream"], fg=t["black"],
                               insertbackground=t["teal"],
                               relief='flat', bd=0)
-        self.entry.pack(side='left', fill='x', expand=True, padx=(7, 0))
+        self.entry.pack(side='left', fill='x', expand=True, padx=(_S(7), _S(0)))
         self.entry.insert(0, "输入新任务名")
         self.entry.bind('<FocusIn>', lambda e: self._on_entry_focus())
         self.entry.bind('<Button-1>', lambda e: self._select_input(), add='+')
@@ -1458,7 +1606,7 @@ class ModernDialog:
         self.entry.bind('<Down>', lambda e: self._entry_move_to_options())
 
         help_row = tk.Frame(inner, bg=t["cream"])
-        help_row.pack(fill='x', padx=14, pady=(8, 12))
+        help_row.pack(fill='x', padx=_S(14), pady=(_S(8), _S(12)))
 
         for txt, clr in [
             ("↑/↓ 选择", t["ink_3"]),
@@ -1469,7 +1617,7 @@ class ModernDialog:
         ]:
             tk.Label(help_row, text=txt,
                      font=('Microsoft YaHei', 8, 'bold'),
-                     bg=t["cream"], fg=clr).pack(side='left', padx=(0, 10))
+                     bg=t["cream"], fg=clr).pack(side='left', padx=(_S(0), _S(10)))
 
         self.root.bind('<Enter>', lambda e: self._activate_focus())
         self.root.bind('<Leave>', lambda e: self._deactivate_if_pointer_left())
@@ -1593,21 +1741,21 @@ class ModernDialog:
         bg = t["cream"]
         row = tk.Frame(parent, bg=bg, highlightthickness=2,
                        highlightbackground=t["black"], cursor='hand2')
-        row.pack(fill='x', pady=(0, 6))
+        row.pack(fill='x', pady=(_S(0), _S(6)))
 
-        stripe = tk.Canvas(row, width=5, height=34, bg=bg,
+        stripe = ScaledCanvas(row, width=5, height=34, bg=bg,
                            highlightthickness=0, bd=0, cursor='hand2')
         stripe.pack(side='left', fill='y')
 
         key_lbl = tk.Label(row, text=f"[{idx + 1}]",
                            font=('JetBrains Mono', 10, 'bold'),
                            bg=bg, fg=t["black"], cursor='hand2')
-        key_lbl.pack(side='left', padx=(10, 8), pady=6)
+        key_lbl.pack(side='left', padx=(_S(10), _S(8)), pady=_S(6))
 
         name_lbl = tk.Label(row, text=opt[:28],
                             font=('Microsoft YaHei', 10, 'bold'),
                             bg=bg, fg=t["black"], anchor='w', cursor='hand2')
-        name_lbl.pack(side='left', fill='x', expand=True, pady=6)
+        name_lbl.pack(side='left', fill='x', expand=True, pady=_S(6))
 
         edit_btn = None
         del_btn = None
@@ -1615,15 +1763,15 @@ class ModernDialog:
             tid = self.task_ids[idx]
             if self.on_task_edit:
                 edit_btn = tk.Label(row, text="改", font=('Microsoft YaHei', 8, 'bold'),
-                                    bg=t["white"], fg=t["black"], cursor='hand2', padx=5,
+                                    bg=t["white"], fg=t["black"], cursor='hand2', padx=_S(5),
                                     highlightthickness=2, highlightbackground=t["black"])
-                edit_btn.pack(side='right', padx=(0, 3))
+                edit_btn.pack(side='right', padx=(_S(0), _S(3)))
                 edit_btn.bind('<Button-1>', lambda e, tid=tid, opt=opt: self._inline_edit(tid, opt))
             if self.on_task_delete:
                 del_btn = tk.Label(row, text="删", font=('Microsoft YaHei', 8, 'bold'),
-                                   bg=t["white"], fg=t["red"], cursor='hand2', padx=5,
+                                   bg=t["white"], fg=t["red"], cursor='hand2', padx=_S(5),
                                    highlightthickness=2, highlightbackground=t["black"])
-                del_btn.pack(side='right', padx=(0, 8))
+                del_btn.pack(side='right', padx=(_S(0), _S(8)))
                 del_btn.bind('<Button-1>', lambda e, tid=tid, opt=opt: self._delete_task(tid, opt))
 
         row_data = {
@@ -1775,18 +1923,18 @@ class ModernDialog:
         d.attributes('-topmost', True)
 
         f = tk.Frame(d, bg=t["cream"], highlightthickness=3,
-                     highlightbackground=t["black"], padx=14, pady=12)
+                     highlightbackground=t["black"], padx=_S(14), pady=_S(12))
         f.pack()
 
         tk.Label(f, text=f"重命名: {option_text}",
                  font=('Microsoft YaHei', 10, 'bold'),
-                 bg=t["cream"], fg=t["black"]).pack(anchor='w', pady=(0, 8))
+                 bg=t["cream"], fg=t["black"]).pack(anchor='w', pady=(_S(0), _S(8)))
 
         e = tk.Entry(f, font=('Microsoft YaHei', 10, 'bold'),
                      bg=t["white"], fg=t["black"],
                      insertbackground=t["teal"], relief='flat', bd=0,
                      highlightthickness=3, highlightbackground=t["black"])
-        e.pack(ipady=6, ipadx=8)
+        e.pack(ipady=_S(6), ipadx=_S(8))
         e.insert(0, option_text)
         e.select_range(0, 'end')
         e.focus_set()
@@ -1815,7 +1963,7 @@ class ModernDialog:
         e.bind('<Return>', do_save)
         e.bind('<Escape>', _close_edit)
 
-        _place_overlay(d, self.root, 280, 80)
+        _place_overlay(d, self.root, _S(280), _S(80))
         e.focus_set()
         _win_set_topmost(d, True)
         # 标记为模态子窗：主弹窗在此期间不抢焦点；grab_set 双保险。
@@ -1855,10 +2003,10 @@ class ModernDialog:
         else:
             empty = tk.Frame(wrap, bg=t["cream"], highlightthickness=3,
                              highlightbackground=t["black"])
-            empty.pack(fill='x', pady=(0, 8))
+            empty.pack(fill='x', pady=(_S(0), _S(8)))
             tk.Label(empty, text="NO TASKS · ADD BELOW",
                      font=('JetBrains Mono', 10, 'bold'),
-                     bg=t["cream"], fg=t["red"]).pack(pady=15)
+                     bg=t["cream"], fg=t["red"]).pack(pady=_S(15))
         if getattr(self, '_options_canvas', None):
             self._options_canvas.update_idletasks()
             self._options_canvas.configure(scrollregion=self._options_canvas.bbox('all'))
@@ -1902,7 +2050,7 @@ class SettingsWindow:
         self.win.attributes('-topmost', True)
 
         self.win.update_idletasks()
-        w, h = 340, 600
+        w, h = _S(340), _S(600)
         _place_centered(self.win, parent, w, h)
 
         self._create_ui()
@@ -1922,11 +2070,11 @@ class SettingsWindow:
         hdr = tk.Frame(bd, bg=t["yellow"], highlightthickness=0)
         hdr.pack(fill='x')
 
-        title_box = tk.Frame(hdr, bg=t["yellow"], padx=12, pady=10)
+        title_box = tk.Frame(hdr, bg=t["yellow"], padx=_S(12), pady=_S(10))
         title_box.pack(side='left', fill='x', expand=True)
 
-        rivet = tk.Canvas(title_box, width=11, height=11, bg=t["yellow"], highlightthickness=0)
-        rivet.pack(side='left', padx=(0, 8))
+        rivet = ScaledCanvas(title_box, width=11, height=11, bg=t["yellow"], highlightthickness=0)
+        rivet.pack(side='left', padx=(_S(0), _S(8)))
         rivet.create_oval(1, 1, 10, 10, fill=t["black"], outline='')
 
         title_lbl = tk.Label(title_box, text="SETTINGS", font=('JetBrains Mono', 14, 'bold'),
@@ -1940,12 +2088,12 @@ class SettingsWindow:
         close_lbl.bind('<Enter>', lambda e, l=close_lbl: l.config(bg=t["black"], fg=t["yellow"]))
         close_lbl.bind('<Leave>', lambda e, l=close_lbl: l.config(bg=t["red"], fg=t["white"]))
 
-        tk.Frame(bd, bg=t["black"], height=4).pack(fill='x')
+        tk.Frame(bd, bg=t["black"], height=_S(4)).pack(fill='x')
 
         scroll_wrap = tk.Frame(bd, bg=t["cream"])
-        scroll_wrap.pack(fill='both', expand=True, padx=12, pady=(12, 0))
+        scroll_wrap.pack(fill='both', expand=True, padx=_S(12), pady=(_S(12), _S(0)))
 
-        canvas = tk.Canvas(scroll_wrap, bg=t["cream"], highlightthickness=0, bd=0)
+        canvas = ScaledCanvas(scroll_wrap, bg=t["cream"], highlightthickness=0, bd=0)
         scrollbar = CyberScrollbar(scroll_wrap, canvas.yview)
         content = tk.Frame(canvas, bg=t["cream"])
 
@@ -2009,12 +2157,12 @@ class SettingsWindow:
         self._make_toggle(content, "内容感知偏离", "ai_enabled")
         self._make_toggle(content, "正文外发", "body_send")
 
-        tk.Frame(bd, bg=t["black"], height=4).pack(fill='x', pady=(8, 0))
+        tk.Frame(bd, bg=t["black"], height=4).pack(fill='x', pady=(_S(8), _S(0)))
 
         btn_row = tk.Frame(bd, bg=t["cream"])
-        btn_row.pack(fill='x', padx=0, pady=0)
+        btn_row.pack(fill='x', padx=_S(0), pady=_S(0))
 
-        inner_btn = tk.Frame(btn_row, bg=t["cream"], padx=12, pady=12)
+        inner_btn = tk.Frame(btn_row, bg=t["cream"], padx=_S(12), pady=_S(12))
         inner_btn.pack(fill='x')
 
         self._make_metal_btn(inner_btn, "恢复默认", self._reset_defaults,
@@ -2024,7 +2172,7 @@ class SettingsWindow:
         right_box.pack(side='right')
         self._make_metal_btn(right_box, "取消",
                              lambda: self.win.destroy(),
-                             kind='normal').pack(side='left', padx=(0, 8))
+                             kind='normal').pack(side='left', padx=(_S(0), _S(8)))
         self._make_metal_btn(right_box, "保存", self._save,
                              kind='primary').pack(side='left')
 
@@ -2035,16 +2183,16 @@ class SettingsWindow:
     def _make_plate(self, parent, text):
         t = self.theme()
         row = tk.Frame(parent, bg=t["red"], highlightthickness=3, highlightbackground=t["black"])
-        row.pack(fill='x', pady=(12, 8))
+        row.pack(fill='x', pady=(_S(12), _S(8)))
 
-        inner = tk.Frame(row, bg=t["red"], padx=8, pady=4)
+        inner = tk.Frame(row, bg=t["red"], padx=_S(8), pady=_S(4))
         inner.pack(fill='x')
-        rivet = tk.Canvas(inner, width=9, height=9, bg=t["red"], highlightthickness=0)
-        rivet.pack(side='left', padx=(0, 6))
+        rivet = ScaledCanvas(inner, width=9, height=9, bg=t["red"], highlightthickness=0)
+        rivet.pack(side='left', padx=(_S(0), _S(6)))
         rivet.create_oval(1, 1, 8, 8, fill=t["white"], outline=t["black"], width=1)
 
         tk.Label(inner, text=text, font=('Microsoft YaHei', 9, 'bold'),
-                 bg=t["red"], fg=t["white"]).pack(side='left', padx=(0, 8))
+                 bg=t["red"], fg=t["white"]).pack(side='left', padx=(_S(0), _S(8)))
 
     def _show_help_tip(self, widget, text):
         self._hide_help_tip()
@@ -2055,7 +2203,7 @@ class SettingsWindow:
         tip.attributes('-topmost', True)
         tip.configure(bg=t["black"])
         box = tk.Frame(tip, bg=t["cream"], highlightthickness=3,
-                       highlightbackground=t["black"], padx=8, pady=6)
+                       highlightbackground=t["black"], padx=_S(8), pady=_S(6))
         box.pack()
         tk.Label(box, text=text, font=('Microsoft YaHei', 8), bg=t["cream"], fg=t["black"],
                  justify='left', wraplength=220).pack()
@@ -2081,9 +2229,9 @@ class SettingsWindow:
                      current, step, unit, help_text=None, scale=1):
         t = self.theme()
         row = tk.Frame(parent, bg=t["white"])
-        row.pack(fill='x', pady=5)
+        row.pack(fill='x', pady=_S(5))
 
-        label_box = tk.Frame(row, bg=t["white"], width=90, height=28)
+        label_box = tk.Frame(row, bg=t["white"], width=_S(90), height=_S(28))
         label_box.pack(side='left')
         label_box.pack_propagate(False)
         tk.Label(label_box, text=label, font=('Microsoft YaHei', 9, 'bold'),
@@ -2092,7 +2240,7 @@ class SettingsWindow:
             help_lbl = tk.Label(label_box, text="?", font=('JetBrains Mono', 8, 'bold'),
                                 bg=t["yellow"], fg=t["black"], width=2, cursor='question_arrow',
                                 highlightthickness=2, highlightbackground=t["black"])
-            help_lbl.pack(side='left', padx=(5, 0))
+            help_lbl.pack(side='left', padx=(_S(5), _S(0)))
             help_lbl.bind('<Enter>', lambda e, txt=help_text: self._show_help_tip(e.widget, txt))
             help_lbl.bind('<Leave>', lambda e: self._hide_help_tip())
 
@@ -2101,8 +2249,8 @@ class SettingsWindow:
         val_lbl.pack(side='right')
 
         cw, ch = 132, 24
-        c = tk.Canvas(row, width=cw, height=ch, bg=t["white"], highlightthickness=0, bd=0, cursor='hand2')
-        c.pack(side='right', padx=(6, 8))
+        c = ScaledCanvas(row, width=cw, height=ch, bg=t["white"], highlightthickness=0, bd=0, cursor='hand2')
+        c.pack(side='right', padx=(_S(6), _S(8)))
 
         var = tk.IntVar(value=current)
         self._vars[key] = var
@@ -2149,7 +2297,7 @@ class SettingsWindow:
     def _make_toggle(self, parent, label, key):
         t = self.theme()
         row = tk.Frame(parent, bg=t["white"])
-        row.pack(fill='x', pady=6)
+        row.pack(fill='x', pady=_S(6))
 
         tk.Label(row, text=label, font=('Microsoft YaHei', 9, 'bold'),
                  bg=t["white"], fg=t["black"], anchor='w').pack(side='left')
@@ -2158,7 +2306,7 @@ class SettingsWindow:
         self._vars[key] = var
 
         cw, ch = 48, 24
-        c = tk.Canvas(row, width=cw, height=ch, bg=t["white"], highlightthickness=0, bd=0, cursor='hand2')
+        c = ScaledCanvas(row, width=cw, height=ch, bg=t["white"], highlightthickness=0, bd=0, cursor='hand2')
         c.pack(side='right')
 
         def draw():
@@ -2192,7 +2340,7 @@ class SettingsWindow:
             fg = t["black"]
 
         btn = tk.Label(parent, text=text, font=('Microsoft YaHei', 9, 'bold'),
-                       bg=bg, fg=fg, padx=14, pady=6, relief='flat', cursor='hand2',
+                       bg=bg, fg=fg, padx=_S(14), pady=_S(6), relief='flat', cursor='hand2',
                        highlightthickness=3, highlightbackground=t["black"])
         btn.bind('<Button-1>', lambda e: on_click())
         btn.bind('<Enter>', lambda e, b=btn: b.config(bg=t["yellow"], fg=t["black"]))
@@ -2258,8 +2406,8 @@ class StatsWindow:
         self.win.attributes('-topmost', True)
 
         self.win.update_idletasks()
-        self._stats_w = 520
-        _place_centered(self.win, parent, self._stats_w, 460)
+        self._stats_w = _S(520)
+        _place_centered(self.win, parent, self._stats_w, _S(460))
 
         self._create_ui()
         self._load_data()
@@ -2280,22 +2428,22 @@ class StatsWindow:
         inner = tk.Frame(bd, bg=t["cream"])
         inner.pack(fill='both', expand=True)
 
-        self._scanline_canvas = tk.Canvas(inner, bg=t["cream"], highlightthickness=0, bd=0)
+        self._scanline_canvas = ScaledCanvas(inner, bg=t["cream"], highlightthickness=0, bd=0)
         self._scanline_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._draw_scanline()
 
         titlebar = tk.Frame(inner, bg=t["red"])
         titlebar.pack(fill='x')
 
-        title_box = tk.Frame(titlebar, bg=t["red"], padx=12, pady=10)
+        title_box = tk.Frame(titlebar, bg=t["red"], padx=_S(12), pady=_S(10))
         title_box.pack(side='left', fill='x', expand=True)
-        rv = tk.Canvas(title_box, width=12, height=12, bg=t["red"], highlightthickness=0, bd=0)
-        rv.pack(side='left', padx=(0, 8))
+        rv = ScaledCanvas(title_box, width=12, height=12, bg=t["red"], highlightthickness=0, bd=0)
+        rv.pack(side='left', padx=(_S(0), _S(8)))
         rv.create_oval(1, 1, 11, 11, fill=t["white"], outline=t["black"], width=2)
 
         tk.Label(title_box, text="统计",
                  font=('Microsoft YaHei', 13, 'bold'),
-                 bg=t["red"], fg=t["white"], cursor='fleur').pack(side='left', padx=(4, 0))
+                 bg=t["red"], fg=t["white"], cursor='fleur').pack(side='left', padx=(_S(4), _S(0)))
 
         close_lbl = tk.Label(titlebar, text="×",
                              font=('JetBrains Mono', 13, 'bold'),
@@ -2308,29 +2456,29 @@ class StatsWindow:
         prev_btn = tk.Label(nav, text="<",
                             font=('JetBrains Mono', 10, 'bold'),
                             bg=t["white"], fg=t["black"], cursor='hand2',
-                            highlightthickness=2, highlightbackground=t["black"], padx=6)
-        prev_btn.pack(side='left', padx=(0, 6))
+                            highlightthickness=2, highlightbackground=t["black"], padx=_S(6))
+        prev_btn.pack(side='left', padx=(_S(0), _S(6)))
 
         self.date_lbl = tk.Label(nav, text="--",
                                  font=('JetBrains Mono', 10, 'bold'),
-                                 bg=t["white"], fg=t["black"], padx=8, pady=2,
+                                 bg=t["white"], fg=t["black"], padx=_S(8), pady=_S(2),
                                  highlightthickness=2, highlightbackground=t["black"])
         self.date_lbl.pack(side='left')
 
         next_btn = tk.Label(nav, text=">",
                             font=('JetBrains Mono', 10, 'bold'),
                             bg=t["white"], fg=t["black"], cursor='hand2',
-                            highlightthickness=2, highlightbackground=t["black"], padx=6)
-        next_btn.pack(side='left', padx=(6, 0))
+                            highlightthickness=2, highlightbackground=t["black"], padx=_S(6))
+        next_btn.pack(side='left', padx=(_S(6), _S(0)))
         close_lbl.bind('<Button-1>', lambda e: self.win.destroy())
         close_lbl.bind('<Enter>', lambda e: close_lbl.config(bg=t["yellow"], fg=t["black"]))
         close_lbl.bind('<Leave>', lambda e: close_lbl.config(bg=t["black"], fg=t["yellow"]))
 
-        tk.Frame(inner, bg=t["black"], height=4).pack(fill='x')
+        tk.Frame(inner, bg=t["black"], height=_S(4)).pack(fill='x')
 
         # ---- KPI 卡片行 ----
         kpi_row = tk.Frame(inner, bg=t["cream"])
-        kpi_row.pack(fill='x', padx=12, pady=(12, 0))
+        kpi_row.pack(fill='x', padx=_S(12), pady=(_S(12), _S(0)))
 
         self.kpi_cards = {}
         kpi_configs = [
@@ -2344,7 +2492,7 @@ class StatsWindow:
 
         # ---- 本周概览 + 月环 ----
         week_block = tk.Frame(inner, bg=t["cream"])
-        week_block.pack(fill='x', padx=18, pady=(10, 0))
+        week_block.pack(fill='x', padx=_S(18), pady=(_S(10), _S(0)))
 
         # 左侧：柱状图
         chart_col = tk.Frame(week_block, bg=t["cream"])
@@ -2352,9 +2500,9 @@ class StatsWindow:
 
         self._make_plate(chart_col, "本周概览")
 
-        self.chart_canvas = tk.Canvas(chart_col, bg=t["cream"], height=78,
+        self.chart_canvas = ScaledCanvas(chart_col, bg=t["cream"], height=78,
                                       highlightthickness=3, highlightbackground=t["black"], bd=0)
-        self.chart_canvas.pack(fill='x', pady=(8, 2))
+        self.chart_canvas.pack(fill='x', pady=(_S(8), _S(2)))
 
         self.chart_labels = tk.Frame(chart_col, bg=t["cream"])
         self.chart_labels.pack(fill='x')
@@ -2364,9 +2512,9 @@ class StatsWindow:
         ring_col.pack(side='right', fill='y')
         ring_col.pack_propagate(False)
 
-        self.ring_canvas = tk.Canvas(ring_col, bg=t["cream"], width=80, height=80,
+        self.ring_canvas = ScaledCanvas(ring_col, bg=t["cream"], width=80, height=80,
                                      highlightthickness=0, bd=0)
-        self.ring_canvas.pack(pady=(10, 0))
+        self.ring_canvas.pack(pady=(_S(10), _S(0)))
 
         self.ring_meta = tk.Label(ring_col,
                                   text="目标 100h · --",
@@ -2376,18 +2524,18 @@ class StatsWindow:
 
         # ---- 任务排行 ----
         rank_section = tk.Frame(inner, bg=t["cream"])
-        rank_section.pack(fill='x', padx=18, pady=(10, 0))
+        rank_section.pack(fill='x', padx=_S(18), pady=(_S(10), _S(0)))
 
         self._make_plate(rank_section, "任务排行")
 
         self.rank_frame = tk.Frame(rank_section, bg=t["cream"])
-        self.rank_frame.pack(fill='x', pady=(6, 0))
+        self.rank_frame.pack(fill='x', pady=(_S(6), _S(0)))
 
         # ---- Footer ----
         footer = tk.Frame(inner, bg=t["cream"])
-        footer.pack(fill='x', padx=18, pady=(10, 14))
+        footer.pack(fill='x', padx=_S(18), pady=(_S(10), _S(14)))
 
-        tk.Frame(footer, bg=t["rule"], height=1).pack(fill='x', pady=(0, 8))
+        tk.Frame(footer, bg=t["rule"], height=_S(1)).pack(fill='x', pady=(_S(0), _S(8)))
 
         self.footer_lbl = tk.Label(footer,
                                    text="日均 --  |  最长连续 -- 天",
@@ -2405,9 +2553,9 @@ class StatsWindow:
             vy, vh = vs[1], vs[3]
         else:
             vy, vh = 0, self.win.winfo_screenheight()
-        req_h = min(max(420, self.win.winfo_reqheight() + 2), vh - 80)
+        req_h = min(max(_S(420), self.win.winfo_reqheight() + _S(2)), vh - _S(80))
         x = self.win.winfo_x()
-        y = max(vy + 40, min(self.win.winfo_y(), vy + vh - req_h - 40))
+        y = max(vy + _S(40), min(self.win.winfo_y(), vy + vh - req_h - _S(40)))
         self.win.geometry(f'{self._stats_w}x{req_h}+{x}+{y}')
         self._draw_scanline()
 
@@ -2429,7 +2577,7 @@ class StatsWindow:
 
         tag = tk.Label(wrap, text=text,
                        font=('Microsoft YaHei', 9, 'bold'),
-                       bg=t2["yellow"], fg=t2["black"], padx=8, pady=2,
+                       bg=t2["yellow"], fg=t2["black"], padx=_S(8), pady=_S(2),
                        highlightthickness=2, highlightbackground=t2["black"])
         tag.pack(side='left')
 
@@ -2437,9 +2585,9 @@ class StatsWindow:
         t2 = theme()
         card = tk.Frame(parent, bg=t2["cream"], highlightthickness=3,
                         highlightbackground=t2["black"])
-        card.pack(side='left', expand=True, fill='x', padx=(0, 6))
+        card.pack(side='left', expand=True, fill='x', padx=(_S(0), _S(6)))
 
-        stripe = tk.Canvas(card, bg=t2["cream"], height=5,
+        stripe = ScaledCanvas(card, bg=t2["cream"], height=5,
                            highlightthickness=0, bd=0)
         stripe.pack(fill='x')
         stripe.create_rectangle(0, 0, 220, 5, fill=color, outline='')
@@ -2447,12 +2595,12 @@ class StatsWindow:
         val = tk.Label(card, text="--",
                        font=('JetBrains Mono', 22, 'bold'),
                        bg=t2["cream"], fg=t2["black"])
-        val.pack(pady=(7, 0))
+        val.pack(pady=(_S(7), _S(0)))
 
         lb = tk.Label(card, text=name,
                       font=('Microsoft YaHei', 9, 'bold'),
                       bg=t2["cream"], fg=t2["muted"])
-        lb.pack(pady=(0, 8))
+        lb.pack(pady=(_S(0), _S(8)))
 
         return val
 
@@ -2614,7 +2762,7 @@ class StatsWindow:
         if not task_summary:
             tk.Label(self.rank_frame, text="暂无数据",
                      font=('Microsoft YaHei', 9, 'bold'),
-                     bg=t2["white"], fg=t2["muted"]).pack(pady=10)
+                     bg=t2["white"], fg=t2["muted"]).pack(pady=_S(10))
             return
 
         sorted_tasks = sorted(task_summary.items(), key=lambda x: x[1], reverse=True)
@@ -2623,7 +2771,7 @@ class StatsWindow:
 
         for idx, (name, dur) in enumerate(sorted_tasks):
             row = tk.Frame(self.rank_frame, bg=t2["white"])
-            row.pack(fill='x', pady=3)
+            row.pack(fill='x', pady=_S(3))
 
             color = bar_colors[idx % len(bar_colors)]
 
@@ -2632,10 +2780,10 @@ class StatsWindow:
                      bg=t2["white"], fg=t2["black"], anchor='w', width=14
                      ).pack(side='left')
 
-            track = tk.Canvas(row, bg=t2["cream"], highlightthickness=2,
+            track = ScaledCanvas(row, bg=t2["cream"], highlightthickness=2,
                               highlightbackground=t2["black"], bd=0,
                               height=12, width=140)
-            track.pack(side='left', fill='x', expand=True, padx=(6, 6))
+            track.pack(side='left', fill='x', expand=True, padx=(_S(6), _S(6)))
 
             bar_w = max(5, int((dur / max_dur) * 140))
             track.create_rectangle(0, 0, 140, 12, fill=t2["cream"], outline='')
@@ -2695,7 +2843,7 @@ class TaskManagerWindow:
         self.win.attributes('-topmost', True)
 
         self.win.update_idletasks()
-        w, h = 420, 400
+        w, h = _S(420), _S(400)
         _place_centered(self.win, parent, w, h)
 
         self._create_ui()
@@ -2712,17 +2860,17 @@ class TaskManagerWindow:
         inner = tk.Frame(bd, bg=t["cream"])
         inner.pack(fill='both', expand=True)
 
-        self._scanline_canvas = tk.Canvas(inner, bg=t["cream"], highlightthickness=0, bd=0)
+        self._scanline_canvas = ScaledCanvas(inner, bg=t["cream"], highlightthickness=0, bd=0)
         self._scanline_canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._draw_scanline()
 
         hdr = tk.Frame(inner, bg=t["yellow"])
         hdr.pack(fill='x')
 
-        title_box = tk.Frame(hdr, bg=t["yellow"], padx=12, pady=10)
+        title_box = tk.Frame(hdr, bg=t["yellow"], padx=_S(12), pady=_S(10))
         title_box.pack(side='left', fill='x', expand=True)
-        rv = tk.Canvas(title_box, width=11, height=11, bg=t["yellow"], highlightthickness=0, bd=0)
-        rv.pack(side='left', padx=(0, 8))
+        rv = ScaledCanvas(title_box, width=11, height=11, bg=t["yellow"], highlightthickness=0, bd=0)
+        rv.pack(side='left', padx=(_S(0), _S(8)))
         rv.create_oval(1, 1, 10, 10, fill=t["black"], outline='')
 
         tk.Label(title_box, text="任务列表",
@@ -2736,12 +2884,12 @@ class TaskManagerWindow:
         close_lbl.bind('<Enter>', lambda e: close_lbl.config(bg=t["black"], fg=t["yellow"]))
         close_lbl.bind('<Leave>', lambda e: close_lbl.config(bg=t["red"], fg=t["white"]))
 
-        tk.Frame(inner, bg=t["black"], height=4).pack(fill='x')
+        tk.Frame(inner, bg=t["black"], height=_S(4)).pack(fill='x')
 
         list_bg = tk.Frame(inner, bg=t["cream"])
-        list_bg.pack(fill='both', expand=True, padx=12, pady=(12, 0))
+        list_bg.pack(fill='both', expand=True, padx=_S(12), pady=(_S(12), _S(0)))
 
-        self.task_list_canvas = tk.Canvas(list_bg, bg=t["cream"], highlightthickness=0, bd=0)
+        self.task_list_canvas = ScaledCanvas(list_bg, bg=t["cream"], highlightthickness=0, bd=0)
         self.task_list_scroll = CyberScrollbar(list_bg, self.task_list_canvas.yview)
         self.task_list_frame = tk.Frame(self.task_list_canvas, bg=t["cream"])
         self.task_list_window = self.task_list_canvas.create_window(
@@ -2752,13 +2900,13 @@ class TaskManagerWindow:
         self.task_list_canvas.bind('<MouseWheel>', self._on_task_list_mousewheel)
         self.task_list_frame.bind('<MouseWheel>', self._on_task_list_mousewheel)
         self.task_list_canvas.pack(side='left', fill='both', expand=True)
-        self.task_list_scroll.pack(side='right', fill='y', padx=(4, 0))
+        self.task_list_scroll.pack(side='right', fill='y', padx=(_S(4), _S(0)))
 
         add_wrap = tk.Frame(inner, bg=t["cream"], highlightthickness=3,
                             highlightbackground=t["black"])
-        add_wrap.pack(fill='x', padx=12, pady=(8, 12))
+        add_wrap.pack(fill='x', padx=_S(12), pady=(_S(8), _S(12)))
 
-        add_row = tk.Frame(add_wrap, bg=t["cream"], padx=10, pady=8)
+        add_row = tk.Frame(add_wrap, bg=t["cream"], padx=_S(10), pady=_S(8))
         add_row.pack(fill='x')
 
         tk.Label(add_row, text=">", font=('JetBrains Mono', 11, 'bold'),
@@ -2767,7 +2915,7 @@ class TaskManagerWindow:
         self.new_entry = tk.Entry(add_row, font=('Microsoft YaHei', 10, 'bold'),
                                   bg=t["cream"], fg=t["black"],
                                   insertbackground=t["teal"], relief='flat', bd=0)
-        self.new_entry.pack(side='left', fill='x', expand=True, padx=(7, 0))
+        self.new_entry.pack(side='left', fill='x', expand=True, padx=(_S(7), _S(0)))
         self.new_entry.insert(0, "输入新任务名")
         self.new_entry.bind('<FocusIn>', self._on_new_entry_focus)
         self.new_entry.bind('<Return>', lambda e: self._add_task())
@@ -2789,7 +2937,7 @@ class TaskManagerWindow:
         self.task_list_canvas.configure(scrollregion=self.task_list_canvas.bbox('all'))
 
     def _on_task_list_canvas_configure(self, event):
-        self.task_list_canvas.itemconfigure(self.task_list_window, width=event.width - 14)
+        self.task_list_canvas.itemconfigure(self.task_list_window, width=event.width - _S(14))
 
     def _on_task_list_mousewheel(self, event):
         self.task_list_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
@@ -2809,11 +2957,11 @@ class TaskManagerWindow:
         if not tasks:
             empty = tk.Frame(self.task_list_frame, bg=t["cream"],
                              highlightthickness=3, highlightbackground=t["black"])
-            empty.pack(fill='both', expand=True, pady=12)
+            empty.pack(fill='both', expand=True, pady=_S(12))
             tk.Label(empty, text="ADD FIRST TASK", font=('JetBrains Mono', 14, 'bold'),
                      bg=t["cream"], fg=t["red"]).pack(expand=True)
             tk.Label(empty, text="输入任务名后按 ENTER", font=('Microsoft YaHei', 9, 'bold'),
-                     bg=t["cream"], fg=t["black"]).pack(pady=(0, 44))
+                     bg=t["cream"], fg=t["black"]).pack(pady=(_S(0), _S(44)))
             return
 
         today_activities = self.db.get_today_activities()
@@ -2832,22 +2980,22 @@ class TaskManagerWindow:
         t = theme()
         card_bg = t["cream"] if is_current else t["white"]
         shadow = tk.Frame(self.task_list_frame, bg=t["black"])
-        shadow.pack(fill='x', pady=(0, 10), padx=(5, 1))
+        shadow.pack(fill='x', pady=(_S(0), _S(10)), padx=(_S(5), _S(1)))
         card = tk.Frame(shadow, bg=card_bg,
                         highlightthickness=3, highlightbackground=t["black"])
-        card.pack(fill='x', padx=(0, 4), pady=(0, 4))
+        card.pack(fill='x', padx=(_S(0), _S(4)), pady=(_S(0), _S(4)))
 
-        row = tk.Frame(card, bg=card_bg, padx=0, pady=0)
+        row = tk.Frame(card, bg=card_bg, padx=_S(0), pady=_S(0))
         row.pack(fill='x')
 
-        stripe = tk.Canvas(row, width=7, height=58, bg=card_bg,
+        stripe = ScaledCanvas(row, width=7, height=58, bg=card_bg,
                            highlightthickness=0, bd=0)
         stripe.pack(side='left', fill='y')
         stripe.create_rectangle(0, 0, 7, 70, fill=t["yellow"] if is_current else color, outline='')
         if is_current:
             stripe.create_rectangle(0, 0, 7, 16, fill=t["red"], outline='')
 
-        info = tk.Frame(row, bg=card_bg, padx=10, pady=8)
+        info = tk.Frame(row, bg=card_bg, padx=_S(10), pady=_S(8))
         info.pack(side='left', fill='x', expand=True)
 
         name_lbl = tk.Label(info, text=task.name[:24],
@@ -2860,25 +3008,34 @@ class TaskManagerWindow:
         meta = "尚未开始" if duration <= 0 else f"{self._fmt_duration(duration)} · {pomo_count} 轮专注"
         tk.Label(info, text=meta,
                  font=('Microsoft YaHei', 8, 'bold'),
-                 bg=card_bg, fg=t["muted"], anchor='w').pack(fill='x', pady=(3, 0))
+                 bg=card_bg, fg=t["muted"], anchor='w').pack(fill='x', pady=(_S(3), _S(0)))
 
         if is_current:
             tk.Label(row, text="ACTIVE",
                      font=('JetBrains Mono', 8, 'bold'),
-                     bg=t["red"], fg=t["white"], padx=6, pady=2).pack(side='left', padx=(0, 8))
+                     bg=t["red"], fg=t["white"], padx=_S(6), pady=_S(2)).pack(side='left', padx=(_S(0), _S(8)))
 
-        actions = tk.Frame(row, bg=card_bg, padx=8)
+        actions = tk.Frame(row, bg=card_bg, padx=_S(8))
         actions.pack(side='right')
 
+        kw_btn = tk.Label(actions, text="词",
+                          font=('Microsoft YaHei', 8),
+                          bg=card_bg, fg=t["muted"],
+                          padx=_S(4), pady=_S(1), cursor='hand2')
+        kw_btn.pack(side='left', padx=(_S(0), _S(6)))
+        kw_btn.bind('<Button-1>', lambda e, tsk=task: self._manage_keywords(tsk))
+        kw_btn.bind('<Enter>', lambda e: kw_btn.config(fg=t["black"]))
+        kw_btn.bind('<Leave>', lambda e: kw_btn.config(fg=t["muted"]))
+
         edit_btn = self._make_action_btn(actions, "改", t["black"])
-        edit_btn.pack(side='left', padx=(0, 5))
+        edit_btn.pack(side='left', padx=(_S(0), _S(5)))
         edit_btn.bind('<Button-1>', lambda e, tsk=task: self._edit_task(tsk, self.name_labels.get(tsk.id)))
 
         del_btn = self._make_action_btn(actions, "删", t["red"])
         del_btn.pack(side='left')
         del_btn.bind('<Button-1>', lambda e, tsk=task: self._delete_task(tsk))
 
-        for widget in (shadow, card, row, stripe, info, name_lbl, actions, edit_btn, del_btn):
+        for widget in (shadow, card, row, stripe, info, name_lbl, actions, kw_btn, edit_btn, del_btn):
             widget.bind('<MouseWheel>', self._on_task_list_mousewheel, add='+')
 
     def _make_action_btn(self, parent, text, fg):
@@ -2886,7 +3043,7 @@ class TaskManagerWindow:
         lbl = tk.Label(parent, text=text,
                        font=('Microsoft YaHei', 9, 'bold'),
                        bg=t["white"], fg=fg,
-                       padx=7, pady=3, cursor='hand2',
+                       padx=_S(7), pady=_S(3), cursor='hand2',
                        highlightthickness=2, highlightbackground=t["black"])
         lbl.bind('<Enter>', lambda e: lbl.config(bg=t["yellow"], fg=t["black"]))
         lbl.bind('<Leave>', lambda e: lbl.config(bg=t["white"], fg=fg))
@@ -2895,6 +3052,7 @@ class TaskManagerWindow:
     def _edit_task(self, task, label_widget=None):
         t = theme()
         old_name = task.name
+        old_desc = getattr(task, 'description', '') or ''
 
         d = tk.Toplevel(self.win)
         d.withdraw()
@@ -2903,37 +3061,67 @@ class TaskManagerWindow:
         d.attributes('-topmost', True)
 
         f = tk.Frame(d, bg=t["cream"], highlightthickness=3,
-                     highlightbackground=t["black"], padx=14, pady=12)
+                     highlightbackground=t["black"], padx=_S(14), pady=_S(12))
         f.pack()
 
-        tk.Label(f, text=f"重命名: {old_name}",
+        tk.Label(f, text=f"编辑: {old_name}",
                  font=('Microsoft YaHei', 10, 'bold'),
-                 bg=t["cream"], fg=t["black"]).pack(anchor='w', pady=(0, 8))
+                 bg=t["cream"], fg=t["black"]).pack(anchor='w', pady=(_S(0), _S(8)))
 
+        tk.Label(f, text="名称",
+                 font=('Microsoft YaHei', 8, 'bold'),
+                 bg=t["cream"], fg=t["muted"]).pack(anchor='w')
         e = tk.Entry(f, font=('Microsoft YaHei', 10, 'bold'),
                      bg=t["white"], fg=t["black"],
                      insertbackground=t["teal"], relief='flat', bd=0,
                      highlightthickness=3, highlightbackground=t["black"])
-        e.pack(ipady=6, ipadx=8)
+        e.pack(fill='x', ipady=_S(6), ipadx=_S(8), pady=(_S(2), _S(10)))
         e.insert(0, old_name)
         e.select_range(0, 'end')
         e.focus_set()
 
+        tk.Label(f, text="描述（选填，给 AI 判定作上下文）",
+                 font=('Microsoft YaHei', 8, 'bold'),
+                 bg=t["cream"], fg=t["muted"]).pack(anchor='w')
+        desc_e = tk.Entry(f, font=('Microsoft YaHei', 9),
+                          bg=t["white"], fg=t["black"],
+                          insertbackground=t["teal"], relief='flat', bd=0,
+                          highlightthickness=3, highlightbackground=t["black"])
+        desc_e.pack(fill='x', ipady=_S(5), ipadx=_S(8), pady=(_S(2), _S(4)))
+        desc_e.insert(0, old_desc)
+
         def do_save(ev=None):
             new_name = e.get().strip()
+            new_desc = desc_e.get().strip()
+            changed = False
             if new_name and new_name != old_name:
                 self.db.rename_task(task.id, new_name)
                 task.name = new_name
                 for tsk in self.tracker.today_tasks:
                     if tsk.id == task.id:
                         tsk.name = new_name
+                changed = True
+            if new_desc != old_desc:
+                self.db.update_task_description(task.id, new_desc)
+                task.description = new_desc
+                for tsk in self.tracker.today_tasks:
+                    if tsk.id == task.id:
+                        tsk.description = new_desc
+                # 若正是当前进行中的任务，热更新供 _classify_context 立即生效
+                if (self.tracker.current_task
+                        and self.tracker.current_task.id == task.id):
+                    self.tracker.current_task.description = new_desc
+                changed = True
+            if changed:
                 self._refresh_list()
             d.destroy()
 
         e.bind('<Return>', do_save)
+        desc_e.bind('<Return>', do_save)
         e.bind('<Escape>', lambda ev: d.destroy())
+        desc_e.bind('<Escape>', lambda ev: d.destroy())
 
-        _place_overlay(d, self.win, 260, 80)
+        _place_overlay(d, self.win, _S(340), _S(170))
         e.focus_set()
         _win_set_topmost(d, True)
         try:
@@ -2950,7 +3138,7 @@ class TaskManagerWindow:
         d.attributes('-topmost', True)
 
         f = tk.Frame(d, bg=t["cream"], highlightthickness=3,
-                     highlightbackground=t["black"], padx=16, pady=12)
+                     highlightbackground=t["black"], padx=_S(16), pady=_S(12))
         f.pack()
 
         is_current = (self.tracker.current_task
@@ -2961,7 +3149,7 @@ class TaskManagerWindow:
 
         tk.Label(f, text=msg,
                  font=('Microsoft YaHei', 10, 'bold'),
-                 bg=t["cream"], fg=t["black"]).pack(pady=(0, 10))
+                 bg=t["cream"], fg=t["black"]).pack(pady=(_S(0), _S(10)))
 
         btn_row = tk.Frame(f, bg=t["cream"])
         btn_row.pack()
@@ -2981,8 +3169,8 @@ class TaskManagerWindow:
         yes_btn = tk.Label(btn_row, text="确认",
                            font=('Microsoft YaHei', 9, 'bold'),
                            bg=t["red"], fg=t["white"], cursor='hand2',
-                           highlightthickness=2, highlightbackground=t["black"], padx=12, pady=4)
-        yes_btn.pack(side='left', padx=(0, 10))
+                           highlightthickness=2, highlightbackground=t["black"], padx=_S(12), pady=_S(4))
+        yes_btn.pack(side='left', padx=(_S(0), _S(10)))
         yes_btn.bind('<Button-1>', lambda e: do_delete())
         yes_btn.bind('<Enter>', lambda e: yes_btn.config(bg=t["black"], fg=t["yellow"]))
         yes_btn.bind('<Leave>', lambda e: yes_btn.config(bg=t["red"], fg=t["white"]))
@@ -2990,7 +3178,7 @@ class TaskManagerWindow:
         no_btn = tk.Label(btn_row, text="取消",
                           font=('Microsoft YaHei', 9, 'bold'),
                           bg=t["white"], fg=t["black"], cursor='hand2',
-                          highlightthickness=2, highlightbackground=t["black"], padx=12, pady=4)
+                          highlightthickness=2, highlightbackground=t["black"], padx=_S(12), pady=_S(4))
         no_btn.pack(side='left')
         no_btn.bind('<Button-1>', lambda e: d.destroy())
         no_btn.bind('<Enter>', lambda e: no_btn.config(bg=t["yellow"], fg=t["black"]))
@@ -2998,10 +3186,111 @@ class TaskManagerWindow:
 
         d.bind('<Escape>', lambda e: d.destroy())
 
-        _place_overlay(d, self.win, 220, 90)
+        _place_overlay(d, self.win, _S(220), _S(90))
         _win_set_topmost(d, True)
         try:
             d.grab_set()
+        except Exception:
+            pass
+
+    def _manage_keywords(self, task):
+        """任务关键词管理面板：展示已学关键词+权重，可勾选删除。"""
+        t = theme()
+        d = tk.Toplevel(self.win)
+        d.withdraw()
+        d.overrideredirect(True)
+        d.configure(bg=t["cream"])
+        d.attributes('-topmost', True)
+
+        outer = tk.Frame(d, bg=t["cream"], highlightthickness=3,
+                         highlightbackground=t["black"])
+        outer.pack(fill='both', expand=True)
+
+        hdr = tk.Frame(outer, bg=t["yellow"], padx=_S(12), pady=_S(8))
+        hdr.pack(fill='x')
+        tk.Label(hdr, text=f"关键词: {task.name[:16]}",
+                 font=('Microsoft YaHei', 10, 'bold'),
+                 bg=t["yellow"], fg=t["black"], cursor='fleur').pack(side='left')
+        close_lbl = tk.Label(hdr, text="×", font=('JetBrains Mono', 11, 'bold'),
+                             bg=t["red"], fg=t["white"], padx=_S(6), cursor='hand2')
+        close_lbl.pack(side='right')
+        close_lbl.bind('<Button-1>', lambda e: d.destroy())
+
+        body = tk.Frame(outer, bg=t["cream"], padx=_S(10), pady=_S(8))
+        body.pack(fill='both', expand=True)
+
+        list_canvas = ScaledCanvas(body, bg=t["cream"], highlightthickness=0, bd=0)
+        list_scroll = CyberScrollbar(body, list_canvas.yview)
+        list_frame = tk.Frame(list_canvas, bg=t["cream"])
+        list_win = list_canvas.create_window((0, 0), window=list_frame, anchor='nw', width=280)
+        list_canvas.configure(yscrollcommand=list_scroll.set)
+        list_frame.bind('<Configure>',
+                        lambda e: list_canvas.configure(scrollregion=list_canvas.bbox('all')))
+        list_canvas.bind('<Configure>',
+                         lambda e: list_canvas.itemconfigure(list_win, width=e.width - _S(4)))
+        list_canvas.pack(side='left', fill='both', expand=True)
+        list_scroll.pack(side='right', fill='y', padx=(_S(4), _S(0)))
+
+        def _on_wheel(e):
+            list_canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+            return 'break'
+        list_canvas.bind('<MouseWheel>', _on_wheel)
+        list_frame.bind('<MouseWheel>', _on_wheel)
+
+        def _refresh():
+            for w in list_frame.winfo_children():
+                w.destroy()
+            rows = self.db.get_top_keywords(task.id, 60)
+            if not rows:
+                tk.Label(list_frame, text="尚未学习到关键词",
+                         font=('Microsoft YaHei', 9),
+                         bg=t["cream"], fg=t["muted"]).pack(pady=_S(20))
+                return
+            for term, weight in rows:
+                row = tk.Frame(list_frame, bg=t["white"],
+                               highlightthickness=1, highlightbackground=t["black"])
+                row.pack(fill='x', pady=(_S(0), _S(4)))
+                tk.Label(row, text=term,
+                         font=('Microsoft YaHei', 9),
+                         bg=t["white"], fg=t["black"],
+                         anchor='w', padx=_S(8), pady=_S(4)).pack(side='left', fill='x', expand=True)
+                tk.Label(row, text=f"×{int(weight)}",
+                         font=('JetBrains Mono', 8),
+                         bg=t["white"], fg=t["muted"], padx=_S(4)).pack(side='left')
+                x_btn = tk.Label(row, text="×",
+                                 font=('JetBrains Mono', 10, 'bold'),
+                                 bg=t["white"], fg=t["red"], padx=_S(8),
+                                 cursor='hand2')
+                x_btn.pack(side='right')
+                x_btn.bind('<Button-1>',
+                           lambda e, tm=term: (self.db.delete_task_keyword(task.id, tm),
+                                                self._sync_current_task_keywords(task.id),
+                                                _refresh()))
+                x_btn.bind('<Enter>', lambda e, b=x_btn: b.config(bg=t["red"], fg=t["white"]))
+                x_btn.bind('<Leave>', lambda e, b=x_btn: b.config(bg=t["white"], fg=t["red"]))
+                row.bind('<MouseWheel>', _on_wheel, add='+')
+
+        _refresh()
+
+        _bind_title_drag(d, hdr)
+        _place_overlay(d, self.win, _S(320), _S(360))
+        _win_set_topmost(d, True)
+        try:
+            d.grab_set()
+        except Exception:
+            pass
+        d.bind('<Escape>', lambda e: d.destroy())
+
+    def _sync_current_task_keywords(self, task_id):
+        """删词后若正是当前进行任务，热更新 self.tracker.current_task.keywords。"""
+        try:
+            new_kw = self.db.sync_task_keywords_field(task_id)
+            if (self.tracker.current_task
+                    and self.tracker.current_task.id == task_id):
+                self.tracker.current_task.keywords = new_kw
+            for tsk in self.tracker.today_tasks:
+                if tsk.id == task_id:
+                    tsk.keywords = new_kw
         except Exception:
             pass
 
@@ -3071,12 +3360,29 @@ class ControlPanel:
         sh = self.root.winfo_screenheight()
         cx = config.get("window_x", -1)
         cy = config.get("window_y", -1)
-        if cx < 0 or cy < 0:
-            cx = sw - self.WIDTH - 24
-            cy = 80
-        cx = max(0, min(cx, sw - self.WIDTH))
-        cy = max(0, min(cy, sh - self.HEIGHT))
-        self.root.geometry(f'{self.WIDTH}x{self.HEIGHT}+{cx}+{cy}')
+
+        # 先按目标屏 DPI 计算全局缩放,再算窗口尺寸,避免用 _SCALE=1.0 设几何后被截断
+        probe_x = cx if cx >= 0 else sw - 100
+        probe_y = cy if cy >= 0 else 80
+        _apply_ui_scale(self.root, probe_x, probe_y)
+        self._last_dpi_scale = _SCALE
+
+        # 多屏 clamp: 用虚拟桌面而非主屏,允许 B 屏的坐标(可能为负)
+        vs = _virtual_screen()
+        if vs:
+            vx, vy, vw, vh = vs
+            if cx < 0 or cy < 0:
+                cx = vx + vw - _S(self.WIDTH) - _S(24)
+                cy = vy + _S(80)
+            cx = max(vx, min(cx, vx + vw - _S(self.WIDTH)))
+            cy = max(vy, min(cy, vy + vh - _S(self.HEIGHT)))
+        else:
+            if cx < 0 or cy < 0:
+                cx = sw - _S(self.WIDTH) - _S(24)
+                cy = _S(80)
+            cx = max(0, min(cx, sw - _S(self.WIDTH)))
+            cy = max(0, min(cy, sh - _S(self.HEIGHT)))
+        self.root.geometry(f'{_S(self.WIDTH)}x{_S(self.HEIGHT)}+{cx}+{cy}')
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -3198,8 +3504,21 @@ class ControlPanel:
             pass
 
     def _on_drag_drop(self):
-        """拖拽松手回调：保存位置，并按吸边开关决定进入隐藏/自由态。"""
+        """拖拽松手回调：保存位置，检测跨屏 DPI 变化并按需重建 UI。"""
         self._save_position()
+        # 跨屏 DPI 变化检测：拖到另一块不同缩放比的屏上时重建 UI
+        try:
+            # overrideredirect 窗口的 winfo_x/y 常不可靠，用 winfo_rootx/y 取真实屏幕坐标
+            rx = self.root.winfo_rootx() + 20
+            ry = self.root.winfo_rooty() + 20
+            new_scale = _dpi_scale_for_point(rx, ry)
+            if abs(new_scale - self._last_dpi_scale) > 0.15:
+                _apply_ui_scale(self.root, rx, ry)
+                self._last_dpi_scale = _SCALE
+                self._rebuild_for_dpi()
+                print(f"[DPI] 跨屏重建 UI，缩放系数 {self._last_dpi_scale:.2f}")
+        except Exception:
+            pass
         if not config.get("edge_hide", False):
             self._apply_window_level()
             return
@@ -3254,20 +3573,20 @@ class ControlPanel:
         if self._hidden_geo:
             _, gy, _, gh = self._hidden_geo
         else:
-            gy, gh = 80, self.HEIGHT
-        sx = mx if self._snap_edge == 'left' else mx + mw - self._strip_w
+            gy, gh = _S(80), _S(self.HEIGHT)
+        sx = mx if self._snap_edge == 'left' else mx + mw - _S(self._strip_w)
         if self._reveal_strip is None or not self._reveal_strip.winfo_exists():
             strip = tk.Toplevel(self.root)
             strip.overrideredirect(True)
             strip.attributes('-topmost', True)
-            cv = tk.Canvas(strip, width=self._strip_w, height=gh,
+            cv = ScaledCanvas(strip, width=self._strip_w, height=gh,
                            highlightthickness=0, bd=0)
             cv.pack(fill='both', expand=True)
             strip.bind('<Enter>', lambda e: self._reveal())
             cv.bind('<Enter>', lambda e: self._reveal())
             self._reveal_strip = strip
             self._reveal_canvas = cv
-        self._reveal_strip.geometry(f'{self._strip_w}x{gh}+{sx}+{gy}')
+        self._reveal_strip.geometry(f'{_S(self._strip_w)}x{gh}+{sx}+{gy}')
         self._reveal_strip.deiconify()
         self._refresh_reveal_strip()
 
@@ -3280,8 +3599,8 @@ class ControlPanel:
                 return
             t = self.theme()
             cv = self._reveal_canvas
-            h = self._reveal_strip.winfo_height() or self.HEIGHT
-            w = self._strip_w
+            h = self._reveal_strip.winfo_height() or _S(self.HEIGHT)
+            w = _S(self._strip_w)
             _, progress = self._compute_tick_state()
             progress = max(0.0, min(1.0, progress))
             cv.delete('all')
@@ -3305,7 +3624,7 @@ class ControlPanel:
         if self._hidden_geo:
             _, gy, gw, gh = self._hidden_geo
         else:
-            gy, gw, gh = 80, self.WIDTH, self.HEIGHT
+            gy, gw, gh = _S(80), _S(self.WIDTH), _S(self.HEIGHT)
         x = mx if self._snap_edge == 'left' else mx + mw - gw
         self._edge_state = 'shown'
         self._hide_reveal_strip()
@@ -3348,12 +3667,39 @@ class ControlPanel:
             except Exception:
                 pass
 
+    def _rebuild_for_dpi(self):
+        """跨屏拖拽到不同 DPI 屏时重建窗口：缩放已通过 _apply_ui_scale 更新，
+        此处只需重算窗口尺寸并重建画布，让 ScaledCanvas 取到新的 _SCALE。"""
+        try:
+            # overrideredirect 窗口 winfo_x/y 不可靠，改用 winfo_rootx/y 取真实屏幕坐标
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        except Exception:
+            return
+        # 多屏 clamp：用虚拟桌面而非主屏，避免把 B 屏坐标拉回主屏
+        vs = _virtual_screen()
+        if vs:
+            vx, vy, vw, vh = vs
+            x = max(vx, min(x, vx + vw - _S(self.WIDTH)))
+            y = max(vy, min(y, vy + vh - _S(self.HEIGHT)))
+        else:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            x = max(0, min(x, sw - _S(self.WIDTH)))
+            y = max(0, min(y, sh - _S(self.HEIGHT)))
+        self.root.geometry(f'{_S(self.WIDTH)}x{_S(self.HEIGHT)}+{x}+{y}')
+        if hasattr(self, 'panel') and self.panel:
+            try:
+                self.panel.destroy()
+            except Exception:
+                pass
+        self._build_ui()
+
     def _build_ui(self):
         t = self.theme()
         self.panel = tk.Frame(self.root, bg=t["black"], highlightthickness=0)
         self.panel.pack(fill='both', expand=True)
 
-        self.canvas = tk.Canvas(self.panel, width=self.WIDTH, height=self.HEIGHT,
+        self.canvas = ScaledCanvas(self.panel, width=self.WIDTH, height=self.HEIGHT,
                                 bg=t["black"], highlightthickness=0, bd=0)
         self.canvas.pack(fill='both', expand=True)
 
@@ -3362,7 +3708,7 @@ class ControlPanel:
         self._render_static()
 
     def _handle_canvas_click(self, event):
-        if event.x >= self.WIDTH - 48 and 12 <= event.y <= 34:
+        if event.x >= _S(self.WIDTH) - _S(48) and _S(12) <= event.y <= _S(34):
             self._toggle_menu(event)
             return "break"
         return None
@@ -3522,15 +3868,15 @@ class ControlPanel:
             ("退出", self._do_quit),
         ]
 
-        row_h = 34
+        row_h = _S(34)
         for it in items:
             if it is None:
-                sep = tk.Frame(bd, bg=t["black"], height=3)
-                sep.pack(fill='x', padx=10, pady=4)
+                sep = tk.Frame(bd, bg=t["black"], height=_S(3))
+                sep.pack(fill='x', padx=_S(10), pady=_S(4))
                 continue
             label, cb = it
             lab = tk.Label(bd, text=label, font=('Microsoft YaHei', 9, 'bold'),
-                           bg=t["white"], fg=t["black"], anchor='w', padx=14, pady=6,
+                           bg=t["white"], fg=t["black"], anchor='w', padx=_S(14), pady=_S(6),
                            relief='flat', cursor='hand2')
             lab.pack(fill='x')
 
@@ -3554,19 +3900,19 @@ class ControlPanel:
         except Exception:
             cx = self.root.winfo_x()
             cy = self.root.winfo_y()
-        rx = cx + self.WIDTH - 146
-        ry = cy + 38
-        total_h = bd.winfo_reqheight() + 8
+        rx = cx + _S(self.WIDTH) - _S(146)
+        ry = cy + _S(38)
+        total_h = bd.winfo_reqheight() + _S(8)
         vs = _virtual_screen()
         if vs:
             vx, vy, vw, vh = vs
-            rx = max(vx, min(rx, vx + vw - 146))
+            rx = max(vx, min(rx, vx + vw - _S(146)))
             ry = max(vy, min(ry, vy + vh - total_h))
-        m.geometry(f'146x{total_h}+{rx}+{ry}')
+        m.geometry(f'{_S(146)}x{total_h}+{rx}+{ry}')
         m.deiconify()
         m.update_idletasks()
         # overrideredirect 窗口首次映射常忽略位置落到 (0,0)，映射后再设一次才稳
-        m.geometry(f'146x{total_h}+{rx}+{ry}')
+        m.geometry(f'{_S(146)}x{total_h}+{rx}+{ry}')
 
         self._menu_window = m
         m.bind('<FocusOut>', lambda e: self._close_menu())
@@ -3777,6 +4123,9 @@ class TimeTracker:
         self.lock_check_thread = None
         self.last_reminder_time = 0
         self.deviation_start_time = 0  # 任务偏离开始时间
+        # maybe_drift 累计流：连续多次拿不准也提醒一次（避免长时间静默）
+        self._maybe_drift_streak = 0
+        self.MAYBE_DRIFT_STREAK_LIMIT = 5  # 连续 N 次 maybe_drift 升级弹窗一次
 
         # 番茄钟与休息统计
         self.current_task_history_seconds = 0  # 当前任务在今日的历史累计专注秒数
@@ -3970,6 +4319,7 @@ class TimeTracker:
                     relation = self._classify_context(window_info)
                     if relation == 'drift':
                         self.is_deviating = True
+                        self._maybe_drift_streak = 0
                         if self.deviation_start_time == 0:
                             self.deviation_start_time = time.time()
                         elif time.time() - self.deviation_start_time >= self.reminder_interval:
@@ -3977,10 +4327,20 @@ class TimeTracker:
                             self.deviation_start_time = 0
                             self.last_reminder_time = time.time()
                             self._ask_task_confirmation(window_info)
-                    else:
-                        # related 或 maybe_drift：视为在容忍范围内，重置偏离计时
+                    elif relation == 'maybe_drift':
+                        # 拿不准不打扰，但连续 N 次也升级弹窗一次，避免长时间静默漂移
+                        self._maybe_drift_streak += 1
                         self.deviation_start_time = 0
                         self.is_deviating = False
+                        if self._maybe_drift_streak >= self.MAYBE_DRIFT_STREAK_LIMIT:
+                            self._maybe_drift_streak = 0
+                            self.last_reminder_time = time.time()
+                            self._ask_task_confirmation(window_info)
+                    else:
+                        # related：确认在做，重置所有偏离信号
+                        self.deviation_start_time = 0
+                        self.is_deviating = False
+                        self._maybe_drift_streak = 0
                 else:
                     self.is_deviating = False
                 
@@ -4070,7 +4430,8 @@ class TimeTracker:
         res = self.ark.classify(
             self.current_task.name, keywords,
             window_info.get('app', ''), title,
-            url, body)
+            url, body,
+            description=getattr(self.current_task, 'description', '') or '')
         if res is None:
             # AI 失败：降级到进程名启发式，避免误弹
             return 'related' if self._is_same_task_context(window_info) else 'maybe_drift'
