@@ -186,11 +186,12 @@ DEFAULT_CONFIG = {
     "auto_start_track": True,       # 启动后自动开始追踪
     "minimize_to_tray": True,       # 关闭窗口时最小化到托盘（False=直接退出）
     "auto_launch": False,           # 开机自启动
-    "silent_start": False,          # 启动时显示主窗口
     "pomodoro_minutes": 30,         # 单个时段时长（分钟）
     "pomodoro_sound": True,         # 完成时段时是否播放提示音
     "rest_per_pomodoro": 5,         # 每个时段对应的建议休息分钟数
     "no_input_threshold": 180,      # 实际无操作判定阈值（秒）
+    "auto_end_threshold": 3600,     # 自动结束阈值（秒），连续无操作超过该时间视为今日工作结束
+    "auto_start_new_day": False,   # 跨日后检测到操作时自动进入工作态（不弹任务选择）
     "window_x": -1,                 # 窗口位置 X（-1 表示自动）
     "window_y": -1,                 # 窗口位置 Y
     "edge_hide": False,             # 吸边隐藏：拖到屏幕左右边缘自动隐藏成露出条，移到露出条唤出
@@ -2114,12 +2115,9 @@ class SettingsWindow:
         self._make_slider(content, "专注单元", "pomodoro_minutes",
                           5, 60, self.cfg.get("pomodoro_minutes", 30), 5, "分钟",
                           "一轮连续投入工作的目标时长，主面板进度条按这个周期循环。")
-        self._make_slider(content, "短恢复", "rest_per_pomodoro",
+        self._make_slider(content, "专注后休息时间", "rest_per_pomodoro",
                           1, 30, self.cfg.get("rest_per_pomodoro", 5), 1, "分钟",
-                          "每完成一个专注单元后，系统用于统计建议恢复时间的基准。")
-        self._make_slider(content, "长恢复", "long_rest_minutes",
-                          5, 60, self.cfg.get("long_rest_minutes", 15), 5, "分钟",
-                          "连续完成多轮专注后建议安排的一段较长恢复时间。")
+                          "每完成一个专注单元后建议休息的时长，用于统计对比实际休息是否偏少。")
 
         # ---- 追踪阈值 ----
         self._make_plate(content, "追踪阈值")
@@ -2142,14 +2140,18 @@ class SettingsWindow:
                           1, 10, int(self.cfg.get("no_input_threshold", 180) // 60), 1, "分钟",
                           "无鼠标键盘输入超过该时间后，累计到今日无操作统计。",
                           scale=60)
+        self._make_slider(content, "自动结束阈值", "auto_end_threshold",
+                          30, 180, int(self.cfg.get("auto_end_threshold", 3600) // 60), 5, "分钟",
+                          "连续无操作超过该时间后，自动判定今日工作结束并弹出复盘。",
+                          scale=60)
 
         # ---- 启动 ----
         self._make_plate(content, "启动")
-        self._make_toggle(content, "完成提示音", "pomodoro_sound")
+        self._make_toggle(content, "专注单元完成提示", "pomodoro_sound")
         self._make_toggle(content, "吸边隐藏", "edge_hide")
         self._make_toggle(content, "关闭到托盘", "minimize_to_tray")
-        self._make_toggle(content, "静默启动", "silent_start")
-        self._make_toggle(content, "自动追踪", "auto_start_track")
+        self._make_toggle(content, "启动后自动记录", "auto_start_track")
+        self._make_toggle(content, "跨日自动开始", "auto_start_new_day")
         self._make_toggle(content, "开机自启", "auto_launch")
 
         # ---- AI 判定 ----
@@ -2392,6 +2394,215 @@ class SettingsWindow:
             info['draw']()
 
 
+class _DatePickerWindow:
+    """简易日历选择器：孟菲斯风格，可切换月份，点击日期回调。
+    每个日期下方有色点：蓝色=有数据，灰色=无数据，未来日期无点。
+    """
+
+    def __init__(self, parent, current_date_str: str, on_pick, db=None):
+        self.on_pick = on_pick
+        self.db = db
+        t = theme()
+        self.win = tk.Toplevel(parent)
+        self.win.title("DATE")
+        self.win.overrideredirect(True)
+        self.win.configure(bg=t["cream"])
+        self.win.attributes('-topmost', True)
+        self.win.update_idletasks()
+
+        try:
+            dt = datetime.strptime(current_date_str, '%Y-%m-%d')
+        except Exception:
+            dt = datetime.now()
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        self._today_str = today_str
+        self._view_year = dt.year
+        self._view_month = dt.month
+        # 数据日期集合（用于色点区分）
+        self._data_dates = set()
+        if self.db is not None:
+            try:
+                for ds in self.db.get_available_dates(limit=120):
+                    self._data_dates.add(ds)
+            except Exception:
+                pass
+
+        self._create_ui()
+        self._draw_month()
+
+        w = _S(224)
+        h = _S(264)
+        _place_overlay(self.win, parent, w, h)
+        self.win.bind('<Escape>', lambda e: self.win.destroy())
+        self.win.focus_set()
+        _win_set_topmost(self.win, True)
+
+    def _maybe_close(self):
+        try:
+            if self.win.focus_get() is None:
+                self.win.destroy()
+        except Exception:
+            pass
+
+    def _create_ui(self):
+        t = theme()
+        bd = tk.Frame(self.win, bg=t["cream"], highlightthickness=4,
+                      highlightbackground=t["black"])
+        bd.pack(fill='both', expand=True)
+
+        # 标题栏：月份 + prev/next
+        titlebar = tk.Frame(bd, bg=t["red"], padx=_S(6), pady=_S(6))
+        titlebar.pack(fill='x')
+
+        prev_m = tk.Label(titlebar, text="<",
+                          font=('JetBrains Mono', 10, 'bold'),
+                          bg=t["white"], fg=t["black"], cursor='hand2',
+                          highlightthickness=2, highlightbackground=t["black"], padx=_S(6))
+        prev_m.pack(side='left')
+        prev_m.bind('<Button-1>', lambda e: self._shift_month(-1))
+
+        self.month_lbl = tk.Label(titlebar, text="",
+                                  font=('JetBrains Mono', 10, 'bold'),
+                                  bg=t["white"], fg=t["black"], padx=_S(10), pady=_S(2),
+                                  highlightthickness=2, highlightbackground=t["black"])
+        self.month_lbl.pack(side='left', fill='x', expand=True)
+
+        next_m = tk.Label(titlebar, text=">",
+                          font=('JetBrains Mono', 10, 'bold'),
+                          bg=t["white"], fg=t["black"], cursor='hand2',
+                          highlightthickness=2, highlightbackground=t["black"], padx=_S(6))
+        next_m.pack(side='left')
+        next_m.bind('<Button-1>', lambda e: self._shift_month(1))
+
+        close_lbl = tk.Label(titlebar, text="×",
+                             font=('JetBrains Mono', 11, 'bold'),
+                             bg=t["black"], fg=t["yellow"], width=3, cursor='hand2')
+        close_lbl.pack(side='right', fill='y')
+        close_lbl.bind('<Button-1>', lambda e: self.win.destroy())
+
+        # 星期标签行
+        dow_row = tk.Frame(bd, bg=t["cream"])
+        dow_row.pack(fill='x', padx=_S(6), pady=(_S(6), _S(2)))
+        for i, name in enumerate(['一', '二', '三', '四', '五', '六', '日']):
+            tk.Label(dow_row, text=name,
+                     font=('Microsoft YaHei', 9, 'bold'),
+                     bg=t["cream"], fg=t["muted"], width=2).pack(side='left', expand=True)
+
+        # 日期网格（6 行 7 列） - 每个格子是 Frame，内含日期数字 + 色点
+        self.grid_frame = tk.Frame(bd, bg=t["cream"])
+        self.grid_frame.pack(fill='both', expand=True, padx=_S(6), pady=(_S(0), _S(6)))
+        self._cells = []
+        self._dots = []
+        for r in range(6):
+            row = tk.Frame(self.grid_frame, bg=t["cream"])
+            row.pack(fill='x', expand=True)
+            for c in range(7):
+                cell = tk.Frame(row, bg=t["white"], highlightthickness=1,
+                                highlightbackground=t["cream"])
+                cell.pack(side='left', expand=True, fill='both', padx=_S(1), pady=_S(1))
+                day_lbl = tk.Label(cell, text="",
+                                   font=('JetBrains Mono', 9, 'bold'),
+                                   bg=t["white"], fg=t["black"], cursor='hand2')
+                day_lbl.pack(side='top', pady=(_S(2), _S(0)))
+                dot = ScaledCanvas(cell, width=4, height=4, bg=t["white"],
+                                   highlightthickness=0, bd=0)
+                dot.pack(side='top', pady=(_S(1), _S(2)))
+                self._cells.append(cell)
+                self._dots.append(dot)
+                # 点击整个格子都触发
+                cell.bind('<Button-1>', lambda e: None)
+                day_lbl.bind('<Button-1>', lambda e, w=cell: None)
+                # 实际绑定在 _draw_month 中按日期设置
+
+    def _shift_month(self, delta: int):
+        m = self._view_month + delta
+        y = self._view_year
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        self._view_year = y
+        self._view_month = m
+        self._draw_month()
+
+    def _draw_month(self):
+        t = theme()
+        import calendar as _cal
+        self.month_lbl.config(text=f"{self._view_year}-{self._view_month:02d}")
+        # 当月 1 号是周几（Mon=0，与 _cal 一致；星期标签从一 开始）
+        first_wd = _cal.monthrange(self._view_year, self._view_month)[0]
+        days_in_month = _cal.monthrange(self._view_year, self._view_month)[1]
+        # 上月尾部天数（用于填充前置空格）
+        prev_days = _cal.monthrange(
+            self._view_year - (1 if self._view_month == 1 else 0),
+            12 if self._view_month == 1 else self._view_month - 1)[1]
+
+        blue = "#2563EB"   # RGB(37,99,235) 与今日复盘日历一致
+        gray = "#D1D5DB"   # RGB(209,213,219) 淡灰
+
+        # 清空所有 cell
+        for idx, cell in enumerate(self._cells):
+            day_lbl = cell.winfo_children()[0] if cell.winfo_children() else None
+            dot = self._dots[idx]
+            cell.config(bg=t["white"], highlightbackground=t["cream"])
+            if day_lbl is not None:
+                day_lbl.config(text="", bg=t["white"], fg=t["black"])
+                day_lbl.unbind('<Button-1>')
+            cell.unbind('<Button-1>')
+            dot.config(bg=t["white"])
+            dot.delete('all')
+
+        for i in range(42):
+            cell = self._cells[i]
+            day_lbl = cell.winfo_children()[0] if cell.winfo_children() else None
+            dot = self._dots[i]
+            if i < first_wd:
+                # 上月日期
+                day = prev_days - first_wd + i + 1
+                cell.config(bg=t["cream"], highlightbackground=t["cream"])
+                if day_lbl is not None:
+                    day_lbl.config(text=str(day), fg=t["muted"], bg=t["cream"])
+                dot.config(bg=t["cream"])
+            elif i < first_wd + days_in_month:
+                # 当月日期
+                day = i - first_wd + 1
+                ds = f"{self._view_year}-{self._view_month:02d}-{day:02d}"
+                is_today = (ds == self._today_str)
+                is_future = (ds > self._today_str)
+                has_data = ds in self._data_dates
+                cell_bg = t["red"] if is_today else t["white"]
+                cell_fg = t["white"] if is_today else t["black"]
+                cell.config(bg=cell_bg, highlightbackground=t["cream"])
+                if day_lbl is not None:
+                    day_lbl.config(text=str(day), fg=cell_fg, bg=cell_bg)
+                    day_lbl.bind('<Button-1>', lambda e, d=ds: self._pick(d))
+                cell.bind('<Button-1>', lambda e, d=ds: self._pick(d))
+                # 色点：未来日期无点，有数据蓝色，无数据灰色
+                if not is_future:
+                    dot_color = blue if has_data else gray
+                    dot.config(bg=cell_bg)
+                    dot.create_oval(0, 0, 4, 4, fill=dot_color, outline=dot_color)
+                else:
+                    dot.config(bg=cell_bg)
+            else:
+                # 下月日期
+                day = i - first_wd - days_in_month + 1
+                cell.config(bg=t["cream"], highlightbackground=t["cream"])
+                if day_lbl is not None:
+                    day_lbl.config(text=str(day), fg=t["muted"], bg=t["cream"])
+                dot.config(bg=t["cream"])
+
+    def _pick(self, date_str: str):
+        try:
+            self.on_pick(date_str)
+        finally:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+
 
 class StatsWindow:
     """统计窗口 — V3: V1 外壳 + KPI 卡片 + 本周柱状图 + 月环 + 任务排行。"""
@@ -2408,6 +2619,14 @@ class StatsWindow:
         self.win.update_idletasks()
         self._stats_w = _S(520)
         _place_centered(self.win, parent, self._stats_w, _S(460))
+
+        # 历史日期切换状态：默认今日；_available_dates 为最近 60 天所有日期 + DB 里有数据的日期（降序）
+        today_dt = datetime.now()
+        today_str = today_dt.strftime('%Y-%m-%d')
+        recent_dates = [(today_dt - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(60)]
+        db_dates = self.db.get_available_dates(limit=60)
+        self._available_dates = sorted(set(recent_dates) | set(db_dates), reverse=True)
+        self._current_date_str = today_str
 
         self._create_ui()
         self._load_data()
@@ -2462,8 +2681,10 @@ class StatsWindow:
         self.date_lbl = tk.Label(nav, text="--",
                                  font=('JetBrains Mono', 10, 'bold'),
                                  bg=t["white"], fg=t["black"], padx=_S(8), pady=_S(2),
-                                 highlightthickness=2, highlightbackground=t["black"])
+                                 highlightthickness=2, highlightbackground=t["black"],
+                                 cursor='hand2')
         self.date_lbl.pack(side='left')
+        self.date_lbl.bind('<Button-1>', lambda e: self._open_date_picker())
 
         next_btn = tk.Label(nav, text=">",
                             font=('JetBrains Mono', 10, 'bold'),
@@ -2474,6 +2695,16 @@ class StatsWindow:
         close_lbl.bind('<Enter>', lambda e: close_lbl.config(bg=t["yellow"], fg=t["black"]))
         close_lbl.bind('<Leave>', lambda e: close_lbl.config(bg=t["black"], fg=t["yellow"]))
 
+        # 历史切换：< 往更早日期（昨天/前天），> 往更近今日（明天/后天，上限今日）
+        prev_btn.bind('<Button-1>', lambda e: self._shift_date(-1))
+        next_btn.bind('<Button-1>', lambda e: self._shift_date(1))
+        prev_btn.bind('<Enter>', lambda e: prev_btn.config(bg=t["yellow"], fg=t["black"]))
+        prev_btn.bind('<Leave>', lambda e: prev_btn.config(bg=t["white"], fg=t["black"]))
+        next_btn.bind('<Enter>', lambda e: next_btn.config(bg=t["yellow"], fg=t["black"]))
+        next_btn.bind('<Leave>', lambda e: next_btn.config(bg=t["white"], fg=t["black"]))
+        self._prev_btn = prev_btn
+        self._next_btn = next_btn
+
         tk.Frame(inner, bg=t["black"], height=_S(4)).pack(fill='x')
 
         # ---- KPI 卡片行 ----
@@ -2482,45 +2713,51 @@ class StatsWindow:
 
         self.kpi_cards = {}
         kpi_configs = [
-            ("tasks", "任务数", t["teal"]),
-            ("total", "总时长", t["red"]),
-            ("focused", "专注", t["yellow"]),
-            ("efficiency", "效率", t["black"]),
+            ("total", "总记录时长", t["teal"]),
+            ("focused", "有效工作时长", t["red"]),
+            ("away", "离开/休息时长", t["yellow"]),
+            ("efficiency", "有效工作占比", t["black"]),
         ]
         for key, name, color in kpi_configs:
             self.kpi_cards[key] = self._make_kpi_card(kpi_row, name, color)
 
-        # ---- 本周概览 + 月环 ----
+        # ---- 休息对比（期望 vs 实际）----
+        rest_section = tk.Frame(inner, bg=t["cream"])
+        rest_section.pack(fill='x', padx=_S(18), pady=(_S(10), _S(0)))
+
+        self._make_plate(rest_section, "休息对比")
+
+        rest_row = tk.Frame(rest_section, bg=t["cream"])
+        rest_row.pack(fill='x', pady=(_S(6), _S(0)))
+
+        self.rest_expected_lbl = tk.Label(rest_row, text="期望 --",
+                                          font=('JetBrains Mono', 10, 'bold'),
+                                          bg=t["cream"], fg=t["black"])
+        self.rest_expected_lbl.pack(side='left', padx=(_S(0), _S(12)))
+
+        self.rest_actual_lbl = tk.Label(rest_row, text="实际 --",
+                                        font=('JetBrains Mono', 10, 'bold'),
+                                        bg=t["cream"], fg=t["black"])
+        self.rest_actual_lbl.pack(side='left', padx=(_S(0), _S(12)))
+
+        self.rest_diff_lbl = tk.Label(rest_row, text="偏差 --",
+                                      font=('JetBrains Mono', 10, 'bold'),
+                                      bg=t["cream"], fg=t["muted"])
+        self.rest_diff_lbl.pack(side='left', padx=(_S(0), _S(12)))
+
+        self.rest_status_lbl = tk.Label(rest_row, text="",
+                                        font=('Microsoft YaHei', 9, 'bold'),
+                                        bg=t["cream"], fg=t["muted"])
+        self.rest_status_lbl.pack(side='left')
+
+        # ---- 本周概览 + 月环（已隐藏，用户反馈不易理解）----
+        # 保留 chart_canvas / ring_canvas 作为占位（None），避免 _load_data 引用报错
         week_block = tk.Frame(inner, bg=t["cream"])
-        week_block.pack(fill='x', padx=_S(18), pady=(_S(10), _S(0)))
-
-        # 左侧：柱状图
-        chart_col = tk.Frame(week_block, bg=t["cream"])
-        chart_col.pack(side='left', fill='x', expand=True)
-
-        self._make_plate(chart_col, "本周概览")
-
-        self.chart_canvas = ScaledCanvas(chart_col, bg=t["cream"], height=78,
-                                      highlightthickness=3, highlightbackground=t["black"], bd=0)
-        self.chart_canvas.pack(fill='x', pady=(_S(8), _S(2)))
-
-        self.chart_labels = tk.Frame(chart_col, bg=t["cream"])
-        self.chart_labels.pack(fill='x')
-
-        # 右侧：月环
-        ring_col = tk.Frame(week_block, bg=t["cream"], width=110)
-        ring_col.pack(side='right', fill='y')
-        ring_col.pack_propagate(False)
-
-        self.ring_canvas = ScaledCanvas(ring_col, bg=t["cream"], width=80, height=80,
-                                     highlightthickness=0, bd=0)
-        self.ring_canvas.pack(pady=(_S(10), _S(0)))
-
-        self.ring_meta = tk.Label(ring_col,
-                                  text="目标 100h · --",
-                                  font=('JetBrains Mono', 9, 'bold'),
-                                  bg=t["cream"], fg=t["muted"])
-        self.ring_meta.pack()
+        # week_block.pack(fill='x', padx=_S(18), pady=(_S(10), _S(0)))  # 隐藏
+        self.chart_canvas = None
+        self.chart_labels = None
+        self.ring_canvas = None
+        self.ring_meta = None
 
         # ---- 任务排行 ----
         rank_section = tk.Frame(inner, bg=t["cream"])
@@ -2531,17 +2768,10 @@ class StatsWindow:
         self.rank_frame = tk.Frame(rank_section, bg=t["cream"])
         self.rank_frame.pack(fill='x', pady=(_S(6), _S(0)))
 
-        # ---- Footer ----
+        # ---- Footer（已隐藏，用户反馈无参考价值）----
         footer = tk.Frame(inner, bg=t["cream"])
-        footer.pack(fill='x', padx=_S(18), pady=(_S(10), _S(14)))
-
-        tk.Frame(footer, bg=t["rule"], height=_S(1)).pack(fill='x', pady=(_S(0), _S(8)))
-
-        self.footer_lbl = tk.Label(footer,
-                                   text="日均 --  |  最长连续 -- 天",
-                                   font=('JetBrains Mono', 9, 'bold'),
-                                   bg=t["cream"], fg=t["muted"])
-        self.footer_lbl.pack()
+        # footer.pack(fill='x', padx=_S(18), pady=(_S(10), _S(14)))
+        self.footer_lbl = None
 
         # 拖拽 — 仅标题栏
         _bind_title_drag(self.win, titlebar)
@@ -2587,10 +2817,13 @@ class StatsWindow:
                         highlightbackground=t2["black"])
         card.pack(side='left', expand=True, fill='x', padx=(_S(0), _S(6)))
 
-        stripe = ScaledCanvas(card, bg=t2["cream"], height=5,
+        stripe = tk.Canvas(card, bg=t2["cream"], width=1, height=_S(5),
                            highlightthickness=0, bd=0)
         stripe.pack(fill='x')
-        stripe.create_rectangle(0, 0, 220, 5, fill=color, outline='')
+        stripe._bar_color = color
+        stripe._pct = 100  # 默认整条铺满品牌色
+        stripe.bind('<Configure>',
+                    lambda e, s=stripe: self._draw_kpi_stripe(s, s._pct))
 
         val = tk.Label(card, text="--",
                        font=('JetBrains Mono', 22, 'bold'),
@@ -2600,9 +2833,28 @@ class StatsWindow:
         lb = tk.Label(card, text=name,
                       font=('Microsoft YaHei', 9, 'bold'),
                       bg=t2["cream"], fg=t2["muted"])
-        lb.pack(pady=(_S(0), _S(8)))
+        lb.pack(pady=(_S(0), _S(2)))
 
+        sub = tk.Label(card, text="",
+                       font=('JetBrains Mono', 8, 'bold'),
+                       bg=t2["cream"], fg=t2["muted"])
+        sub.pack(pady=(_S(0), _S(6)))
+
+        val.sub = sub
+        val.stripe = stripe
         return val
+
+    def _draw_kpi_stripe(self, stripe, pct):
+        """KPI 卡片顶部进度条：pct 0-100，按比例填充。"""
+        stripe._pct = pct
+        stripe.delete('all')
+        t2 = theme()
+        total_w = max(stripe.winfo_width(), 1)
+        h = _S(5)
+        stripe.create_rectangle(0, 0, total_w, h, fill=t2["rule"], outline='')
+        bar_w = int(total_w * max(0, min(100, pct)) / 100)
+        if bar_w > 0:
+            stripe.create_rectangle(0, 0, bar_w, h, fill=stripe._bar_color, outline='')
 
     # ================================================================
     #  数据加载
@@ -2614,13 +2866,20 @@ class StatsWindow:
         # 刷新扫描线（窗口可能 resize 过）
         self._draw_scanline()
 
-        # 今天日期
-        today = datetime.now()
-        today_str = today.strftime('%Y-%m-%d')
-        self.date_lbl.config(text=today_str)
+        # 当前查看的日期（默认今日，可由 prev/next 或日期选择器切换）
+        cur_str = self._current_date_str
+        cur_date = datetime.strptime(cur_str, '%Y-%m-%d')
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        is_today_view = (cur_str == today_str)
 
-        # 获取今日活动
-        activities = self.db.get_date_activities(today_str)
+        # 获取当日活动
+        activities = self.db.get_date_activities(cur_str)
+
+        has_data = len(activities) > 0
+        date_text = cur_str
+        self.date_lbl.config(text=date_text,
+                             bg=t["red"] if is_today_view else t["white"],
+                             fg=t["white"] if is_today_view else t["black"])
 
         # ---- KPI ----
         task_summary = {}
@@ -2632,18 +2891,52 @@ class StatsWindow:
         total_sec = sum(task_summary.values())
         work_sec = sum(v for k, v in task_summary.items()
                        if '休息' not in k and '离开' not in k and '锁屏' not in k)
-        work_tasks = len([k for k in task_summary
-                          if '休息' not in k and '离开' not in k and '锁屏' not in k])
 
-        self.kpi_cards["tasks"].config(text=str(work_tasks))
+        away_sec = total_sec - work_sec  # 含休息/离开/锁屏（广义）
+
         self.kpi_cards["total"].config(text=self._fmt_duration(total_sec))
         self.kpi_cards["focused"].config(text=self._fmt_duration(work_sec))
-        eff = f"{int(work_sec / total_sec * 100)}%" if total_sec > 0 else "--"
+        self.kpi_cards["away"].config(text=self._fmt_duration(away_sec))
+        eff_pct = int(work_sec / total_sec * 100) if total_sec > 0 else 0
+        eff = f"{eff_pct}%" if total_sec > 0 else "--"
         self.kpi_cards["efficiency"].config(text=eff)
 
-        # ---- 本周柱状图 ----
-        weekday = today.weekday()  # Mon=0
-        monday = today - timedelta(days=weekday)
+        # 有效工作占比卡片：顶部进度条按 eff_pct 填充
+        eff_card = self.kpi_cards["efficiency"]
+        if hasattr(eff_card, 'stripe') and eff_card.stripe is not None:
+            eff_stripe = eff_card.stripe
+            self.win.after(50, lambda: self._draw_kpi_stripe(eff_stripe, eff_pct))
+
+        # ---- 休息对比 ----
+        unit_sec = max(1, config.get("pomodoro_minutes", 30)) * 60
+        completed_pomos = work_sec // unit_sec
+        rest_per_sec = max(1, config.get("rest_per_pomodoro", 5)) * 60
+        expected_rest_sec = completed_pomos * rest_per_sec
+        actual_rest_sec = total_sec - work_sec  # 含休息/离开/锁屏（广义）
+        diff_sec = actual_rest_sec - expected_rest_sec
+        threshold = 10 * 60
+        if abs(diff_sec) <= threshold:
+            rest_status = "正常"
+            rest_status_fg = t["black"]
+        elif diff_sec < 0:
+            rest_status = "偏少，建议主动休息"
+            rest_status_fg = t["red"]
+        else:
+            rest_status = "偏多"
+            rest_status_fg = t["muted"]
+        self.rest_expected_lbl.config(
+            text=f"期望 {self._fmt_duration(expected_rest_sec)}")
+        self.rest_actual_lbl.config(
+            text=f"实际 {self._fmt_duration(actual_rest_sec)}")
+        diff_sign = "+" if diff_sec >= 0 else "-"
+        self.rest_diff_lbl.config(
+            text=f"偏差 {diff_sign}{self._fmt_duration(abs(diff_sec))}",
+            fg=rest_status_fg)
+        self.rest_status_lbl.config(text=rest_status, fg=rest_status_fg)
+
+        # ---- 本周柱状图（以 cur_date 所在周计算）----
+        weekday = cur_date.weekday()  # Mon=0
+        monday = cur_date - timedelta(days=weekday)
         days = [monday + timedelta(days=i) for i in range(7)]
 
         daily_data = []
@@ -2666,29 +2959,84 @@ class StatsWindow:
                 if day_work > max_daily:
                     max_daily = day_work
 
-        self._draw_week_chart(daily_data, max_daily, dow_labels, today_str)
+        if self.chart_canvas is not None:
+            self._draw_week_chart(daily_data, max_daily, dow_labels, today_str)
 
-        # ---- 月环 ----
-        month_prefix = today.strftime('%Y-%m')
-        conn = self.db.get_conn()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT COALESCE(SUM(duration), 0) FROM activities
-            WHERE created_date LIKE ? AND is_idle = 0 AND is_locked = 0
-        ''', (f'{month_prefix}%',))
-        month_sec = cursor.fetchone()[0]
-        conn.close()
-        month_hours = month_sec / 3600
-        target_hours = 100.0
-        pct = min(100, int(month_hours / target_hours * 100))
-        self._draw_ring(pct)
-        self.ring_meta.config(text=f"目标 {int(target_hours)}h · {int(month_hours)}h")
+        # ---- 月环（以 cur_date 所在月计算，已隐藏，保留计算以维持 footer 逻辑）----
+        if self.ring_canvas is not None:
+            month_prefix = cur_date.strftime('%Y-%m')
+            conn = self.db.get_conn()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COALESCE(SUM(duration), 0) FROM activities
+                WHERE created_date LIKE ? AND is_idle = 0 AND is_locked = 0
+            ''', (f'{month_prefix}%',))
+            month_sec = cursor.fetchone()[0]
+            conn.close()
+            month_hours = month_sec / 3600
+            target_hours = 100.0
+            pct = min(100, int(month_hours / target_hours * 100))
+            self._draw_ring(pct)
+            self.ring_meta.config(text=f"目标 {int(target_hours)}h · {int(month_hours)}h")
 
         # ---- 任务排行 ----
         self._draw_ranking(task_summary, work_sec)
 
-        # ---- Footer ----
-        self._update_footer(days, daily_data)
+        # ---- Footer（已隐藏）----
+        if self.footer_lbl is not None:
+            self._update_footer(days, daily_data)
+
+        # ---- prev/next 按钮可用性 ----
+        self._refresh_nav_state()
+
+    def _shift_date(self, direction: int):
+        """逐日切换：direction = +1 往更早日期（前一日），-1 往更近今日（后一日）。
+        不跳过无数据日期，date_lbl 只显示日期本身（不附加"无数据"后缀）。
+        """
+        try:
+            cur = datetime.strptime(self._current_date_str, '%Y-%m-%d')
+        except ValueError:
+            return
+        new_dt = cur + timedelta(days=direction)
+        new_str = new_dt.strftime('%Y-%m-%d')
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        # 不允许切到未来日期
+        if new_str > today_str:
+            return
+        # 限制最早到 60 天前（与 _available_dates 初值保持一致）
+        earliest = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+        if new_str < earliest:
+            return
+        self._current_date_str = new_str
+        self._load_data()
+        self._fit_height()
+
+    def _refresh_nav_state(self):
+        """根据当前日期是否到边界，灰化不可用的方向按钮。"""
+        t = theme()
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        earliest = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+        cur = self._current_date_str
+        # prev_btn = "<" 往更早日期，已到最早则灰化
+        prev_disabled = (cur <= earliest)
+        # next_btn = ">" 往更近今日，已到今日则灰化
+        next_disabled = (cur >= today_str)
+        self._prev_btn.config(
+            fg=t["muted"] if prev_disabled else t["black"],
+            cursor='' if prev_disabled else 'hand2')
+        self._next_btn.config(
+            fg=t["muted"] if next_disabled else t["black"],
+            cursor='' if next_disabled else 'hand2')
+
+    def _open_date_picker(self):
+        """点击日期标签，弹出日历选择器。"""
+        _DatePickerWindow(self.win, self._current_date_str, self._on_date_picked, db=self.db)
+
+    def _on_date_picked(self, date_str: str):
+        """日期选择器回调：切到所选日期。"""
+        self._current_date_str = date_str
+        self._load_data()
+        self._fit_height()
 
     def _draw_week_chart(self, daily_data, max_daily, dow_labels, today_str):
         """7 天柱状图，today 高亮。"""
@@ -2754,7 +3102,7 @@ class StatsWindow:
                       fill=t2["muted"])
 
     def _draw_ranking(self, task_summary, total_sec):
-        """彩色进度条排行。"""
+        """彩色进度条排行。系统任务（休息/离开/锁屏）用灰色 + 系统标签区分。"""
         t2 = theme()
         for w in self.rank_frame.winfo_children():
             w.destroy()
@@ -2770,15 +3118,37 @@ class StatsWindow:
         bar_colors = [t2["red"], t2["teal"], t2["yellow"], t2["black"]]
 
         for idx, (name, dur) in enumerate(sorted_tasks):
+            is_system = any(kw in name for kw in ['休息', '离开', '锁屏'])
             row = tk.Frame(self.rank_frame, bg=t2["white"])
             row.pack(fill='x', pady=_S(3))
 
-            color = bar_colors[idx % len(bar_colors)]
+            if is_system:
+                color = t2["muted"]
+                name_fg = t2["muted"]
+            else:
+                color = bar_colors[idx % len(bar_colors)]
+                name_fg = t2["black"]
 
-            tk.Label(row, text=name[:14],
+            # 固定宽度的名称区，保证所有轨道条起点一致
+            name_area = tk.Frame(row, bg=t2["white"], width=_S(150), height=_S(20))
+            name_area.pack(side='left')
+            name_area.pack_propagate(False)
+
+            if is_system:
+                sys_tag = tk.Label(name_area, text="系统",
+                                   font=('Microsoft YaHei', 7, 'bold'),
+                                   bg=t2["muted"], fg=t2["white"],
+                                   padx=_S(3))
+                sys_tag.pack(side='left', padx=(_S(2), _S(4)))
+                name_max = 8
+            else:
+                name_max = 12
+
+            display_name = name if len(name) <= name_max else (name[:name_max] + '…')
+            tk.Label(name_area, text=display_name,
                      font=('Microsoft YaHei', 9, 'bold'),
-                     bg=t2["white"], fg=t2["black"], anchor='w', width=14
-                     ).pack(side='left')
+                     bg=t2["white"], fg=name_fg, anchor='w'
+                     ).pack(side='left', fill='x', expand=True)
 
             track = ScaledCanvas(row, bg=t2["cream"], highlightthickness=2,
                               highlightbackground=t2["black"], bd=0,
@@ -2788,10 +3158,15 @@ class StatsWindow:
             bar_w = max(5, int((dur / max_dur) * 140))
             track.create_rectangle(0, 0, 140, 12, fill=t2["cream"], outline='')
             track.create_rectangle(0, 0, bar_w, 12, fill=color, outline='')
+            if is_system:
+                # 系统任务追加斜线纹理，进一步区分
+                for sx in range(0, bar_w, 6):
+                    track.create_line(sx, 0, sx + 6, 12,
+                                      fill=t2["white"], width=1)
 
             tk.Label(row, text=self._fmt_duration(dur),
                      font=('JetBrains Mono', 9, 'bold'),
-                     bg=t2["white"], fg=t2["black"], anchor='e', width=7
+                     bg=t2["white"], fg=name_fg, anchor='e', width=7
                      ).pack(side='right')
 
     def _update_footer(self, days, daily_data):
@@ -3343,7 +3718,7 @@ class ControlPanel:
     WIDTH = 340
     HEIGHT = 260
 
-    def __init__(self, tracker, silent=False):
+    def __init__(self, tracker):
         self.tracker = tracker
         self.root = tk.Tk()
         self.root.title("W / TRACE")
@@ -3415,10 +3790,7 @@ class ControlPanel:
         self._colon_blink_loop()
         self._pulse_loop()
 
-        if silent:
-            self.root.withdraw()
-        else:
-            self.show_window()
+        self.show_window()
 
         if not self.tracker.today_tasks and self.tracker.running:
             self.root.after(800, self._switch_task)
@@ -3599,8 +3971,11 @@ class ControlPanel:
                 return
             t = self.theme()
             cv = self._reveal_canvas
-            h = self._reveal_strip.winfo_height() or _S(self.HEIGHT)
-            w = _S(self._strip_w)
+            # ScaledCanvas 的 _create 会再次 _S() 缩放坐标，这里取逻辑像素（不预缩放），
+            # 避免与 winfo_height() 返回的物理像素叠加成双重缩放，导致 teal 填充画到 canvas 外。
+            phys_h = self._reveal_strip.winfo_height() or _S(self.HEIGHT)
+            h = phys_h / _SCALE if _SCALE else phys_h
+            w = self._strip_w
             _, progress = self._compute_tick_state()
             progress = max(0.0, min(1.0, progress))
             cv.delete('all')
@@ -3856,17 +4231,31 @@ class ControlPanel:
         bd = tk.Frame(m, bg=t["white"], highlightthickness=3, highlightbackground=t["black"])
         bd.pack(fill='both', expand=True)
 
-        items = [
-            ("切换任务", self._switch_task),
-            None,
-            ("今日复盘", self._generate_today_review),
-            ("统计", self._open_stats),
-            ("任务列表", self._open_task_manager),
-            None,
-            ("设置", self._open_settings),
-            None,
-            ("退出", self._do_quit),
-        ]
+        # 工作状态切换菜单：根据 work_session 状态决定显示哪些项
+        ws = self.tracker.work_session
+        work_items = []
+        if ws == 'pending' or ws == 'ended':
+            work_items.append(("开始今日工作", self._start_today_work))
+        elif ws == 'active':
+            work_items.append(("暂停", self._pause_today_work))
+            work_items.append(("结束今日工作", self._end_today_work))
+        elif ws == 'paused':
+            work_items.append(("继续", self._resume_today_work))
+            work_items.append(("结束今日工作", self._end_today_work))
+
+        items = []
+        for it in work_items:
+            items.append(it)
+        items.append(None)
+        items.append(("切换任务", self._switch_task))
+        items.append(None)
+        items.append(("今日复盘", self._generate_today_review))
+        items.append(("统计", self._open_stats))
+        items.append(("任务列表", self._open_task_manager))
+        items.append(None)
+        items.append(("设置", self._open_settings))
+        items.append(None)
+        items.append(("退出", self._do_quit))
 
         row_h = _S(34)
         for it in items:
@@ -3941,6 +4330,18 @@ class ControlPanel:
         window_info = WindowTracker.get_active_window_info()
         self.tracker._ask_for_task(window_info)
 
+    def _start_today_work(self):
+        self.tracker._start_work_day()
+
+    def _end_today_work(self):
+        self.tracker._end_work_day()
+
+    def _pause_today_work(self):
+        self.tracker._pause_work_day()
+
+    def _resume_today_work(self):
+        self.tracker._resume_work_day()
+
     def _stop_current(self):
         if self.tracker.running:
             self.tracker.stop()
@@ -3957,6 +4358,8 @@ class ControlPanel:
         self.tracker.reminder_interval = config["reminder_interval"]
         self.tracker.lock_check_interval = config["lock_check_interval"]
         self.tracker.no_input_threshold = config.get("no_input_threshold", 180)
+        self.tracker.auto_end_threshold = config.get("auto_end_threshold", 3600)
+        self.tracker.auto_start_new_day = config.get("auto_start_new_day", False)
         if not config.get("edge_hide", False) and self._edge_state != 'free':
             self._enter_free()
         else:
@@ -4111,12 +4514,19 @@ class TimeTracker:
         self.panel = None  # ControlPanel 引用，由 main() 设置
         self._dialog_active = False
 
+        # 工作日状态机：pending（未开始）/ active（进行中）/ ended（已结束）
+        self.work_session = 'pending'
+        self.work_date = datetime.now().date()  # 当前工作日所属日期，跨日时触发滚动
+        self._idle_continuous_seconds = 0       # active 态下连续无操作累计（用于自动结束判定）
+
         # 从配置加载参数
         self.check_interval = config["check_interval"]
         self.idle_threshold = config["idle_threshold"]
         self.reminder_interval = config["reminder_interval"]
         self.lock_check_interval = config["lock_check_interval"]
         self.no_input_threshold = config.get("no_input_threshold", 180)
+        self.auto_end_threshold = config.get("auto_end_threshold", 3600)
+        self.auto_start_new_day = config.get("auto_start_new_day", False)
 
         # 线程
         self.track_thread = None
@@ -4140,13 +4550,14 @@ class TimeTracker:
     def start(self):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 时间追踪已启动")
         self.running = True
-        
+        # auto_start_track=True 视作"启动即开始今日工作"；否则保持 pending 等用户主动开始
+        self.work_session = 'active'
         self._load_today_tasks()
-        
+
         self.track_thread = threading.Thread(target=self._track_loop)
         self.track_thread.daemon = True
         self.track_thread.start()
-        
+
         self.lock_check_thread = threading.Thread(target=self._lock_check_loop)
         self.lock_check_thread.daemon = True
         self.lock_check_thread.start()
@@ -4288,15 +4699,46 @@ class TimeTracker:
     def _track_loop(self):
         while self.running:
             try:
+                # 跨日滚动：日期变化即重置今日状态机
+                if datetime.now().date() != self.work_date:
+                    self._day_rollover()
+                    time.sleep(self.check_interval)
+                    continue
+
+                # ended 态：静默轮询，不判定、不打扰、不写活动
+                if self.work_session == 'ended':
+                    time.sleep(self.check_interval)
+                    continue
+
+                # paused 态：静默轮询，不判定、不打扰、不写活动（用户主动暂停）
+                if self.work_session == 'paused':
+                    time.sleep(self.check_interval)
+                    continue
+
+                # pending 态：等用户主动开始；开启跨日自动开始且检测到操作则进入 active
+                if self.work_session == 'pending':
+                    if self.auto_start_new_day:
+                        idle_time = WindowTracker.get_idle_time()
+                        if idle_time < self.idle_threshold and self.today_tasks:
+                            self._start_work_day()
+                    time.sleep(self.check_interval)
+                    continue
+
+                # === 以下为 active 态原有逻辑 ===
                 if WindowTracker.is_screen_locked():
                     if self.current_activity and not self.current_activity.is_locked:
                         self._end_activity()
                         self._start_activity(Task(id='locked', name='🔒 锁屏/离开'), is_locked=True)
+                    # 锁屏期间也累计连续无操作，触发自动结束
+                    self._idle_continuous_seconds += self.check_interval
+                    if self._idle_continuous_seconds >= self.auto_end_threshold:
+                        self._end_work_day()
+                        continue
                     time.sleep(self.check_interval)
                     continue
-                
+
                 window_info = WindowTracker.get_active_window_info()
-                
+
                 idle_time = WindowTracker.get_idle_time()
                 if idle_time >= self.idle_threshold:
                     if self.current_activity and not self.current_activity.is_idle:
@@ -4305,8 +4747,15 @@ class TimeTracker:
                     # 无操作累计：超过设定阈值后，每个 check_interval 累入今日无操作
                     if idle_time >= self.no_input_threshold:
                         self.today_no_input_seconds += self.check_interval
+                    # 连续无操作达到自动结束阈值 -> 今日工作结束
+                    self._idle_continuous_seconds += self.check_interval
+                    if self._idle_continuous_seconds >= self.auto_end_threshold:
+                        self._end_work_day()
+                        continue
                     time.sleep(self.check_interval)
                     continue
+                # 用户回到工位，清空连续无操作累计
+                self._idle_continuous_seconds = 0
                 # 非 idle 区间，但 idle_time 仍可能 ≥ no_input_threshold（短暂离开但未超 idle 阈值）
                 if idle_time >= self.no_input_threshold:
                     self.today_no_input_seconds += self.check_interval
@@ -4343,26 +4792,30 @@ class TimeTracker:
                         self._maybe_drift_streak = 0
                 else:
                     self.is_deviating = False
-                
+
                 # 未识别提醒：无当前任务时定期提醒
                 if not self.current_task and self.running:
                     now = time.time()
                     if now - self.last_reminder_time >= self.reminder_interval:
                         self.last_reminder_time = now
                         self._ask_for_task(window_info)
-                
+
                 if self.current_activity:
                     self.current_activity.duration += self.check_interval
-                
+
                 time.sleep(self.check_interval)
-                
+
             except Exception as e:
                 print(f"追踪出错: {e}")
                 time.sleep(self.check_interval)
-    
+
     def _lock_check_loop(self):
         while self.running:
             try:
+                # 非 active 态不写 locked 活动，避免 ended/pending 态污染当日数据
+                if self.work_session != 'active':
+                    time.sleep(self.lock_check_interval)
+                    continue
                 if WindowTracker.is_screen_locked():
                     if self.current_activity and not self.current_activity.is_locked:
                         self._end_activity()
@@ -4631,6 +5084,81 @@ class TimeTracker:
         self.db.save_activity(self.current_activity)
         print(f"[{now.strftime('%H:%M:%S')}] 结束任务: {self.current_activity.task_name} ({self.current_activity.duration}秒)")
         self.current_activity = None
+
+    def _day_rollover(self):
+        """跨日滚动：落库当前活动、清空今日累计统计、重置状态机到 pending。
+        无锁、无对话框，纯状态重置。"""
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 跨日滚动 -> 重置今日状态")
+        if self.current_activity:
+            self._end_activity()
+        self.today_no_input_seconds = 0
+        self.deviation_start_time = 0
+        self._maybe_drift_streak = 0
+        self.is_deviating = False
+        self._idle_continuous_seconds = 0
+        self.current_task = None
+        self.work_date = datetime.now().date()
+        self.work_session = 'pending'
+        self.today_tasks = self.db.get_tasks()
+        if self.auto_start_new_day and self.today_tasks:
+            self._start_work_day()
+
+    def _start_work_day(self):
+        """开始今日工作：从 pending/ended 切到 active，弹任务选择。
+        若跨日未处理会先走一次 _day_rollover。"""
+        today = datetime.now().date()
+        if today != self.work_date:
+            self._day_rollover()
+            return
+        if self.work_session == 'active':
+            return
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始今日工作")
+        self.work_session = 'active'
+        self._idle_continuous_seconds = 0
+        if not self.today_tasks:
+            self._show_task_planning()
+        elif not self.current_task and self.panel:
+            self.panel.root.after(300, self._prompt_select_task)
+
+    def _end_work_day(self):
+        """结束今日工作：落库当前活动、切到 ended、弹今日复盘。
+        进入 ended 态后 _track_loop 仅静默轮询，不再做偏离判定或弹任务确认。"""
+        if self.work_session == 'ended':
+            return
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 今日工作结束")
+        if self.current_activity:
+            self._end_activity()
+        self.work_session = 'ended'
+        self.deviation_start_time = 0
+        self._maybe_drift_streak = 0
+        self.is_deviating = False
+        self.current_task = None
+        if self.panel:
+            self.panel.root.after(300, self.panel._generate_today_review)
+
+    def _pause_work_day(self):
+        """暂停今日工作：落库当前活动、切到 paused。
+        进入 paused 态后 _track_loop 仅静默轮询，不判定、不打扰、不写活动。"""
+        if self.work_session != 'active':
+            return
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 今日工作已暂停")
+        if self.current_activity:
+            self._end_activity()
+        self.work_session = 'paused'
+        self.deviation_start_time = 0
+        self._maybe_drift_streak = 0
+        self.is_deviating = False
+        self.current_task = None
+
+    def _resume_work_day(self):
+        """继续今日工作：从 paused 切回 active，弹任务选择。"""
+        if self.work_session != 'paused':
+            return
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 今日工作继续")
+        self.work_session = 'active'
+        self._idle_continuous_seconds = 0
+        if self.today_tasks and not self.current_task and self.panel:
+            self.panel.root.after(300, self._prompt_select_task)
     
     def generate_report(self) -> str:
         activities = self.db.get_today_activities()
@@ -4660,11 +5188,34 @@ class TimeTracker:
         report.append("=" * 50)
         return "\n".join(report)
 
-    def generate_html_report(self) -> str:
-        activities = self.db.get_today_activities()
-        now = datetime.now()
-        report_path = os.path.join(SCRIPT_DIR, f"worktrace_review_{now.strftime('%Y%m%d')}.html")
+    def generate_html_report(self, date_str: str = None) -> str:
+        """生成单个 HTML 复盘文件，内嵌所有有数据日期 + 今日的数据，浏览器内 JS 渲染。
+        支持日期选择器直接跳转任意日期、prev/next 逐日切换；切到没数据的日期显示"无数据"页面但仍可切换。
+        """
+        import json as _json
 
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        target = date_str or today_str
+
+        available = self.db.get_available_dates(limit=60)
+        all_dates = sorted(set(available) | {today_str}, reverse=True)
+
+        review_data = {}
+        for ds in all_dates:
+            try:
+                review_data[ds] = self._collect_review_data(ds)
+            except Exception as e:
+                print(f"收集复盘数据失败 {ds}: {e}")
+
+        path = os.path.join(SCRIPT_DIR, "worktrace_review.html")
+        html_doc = self._build_review_html_doc(target, review_data, all_dates, today_str)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(html_doc)
+        return path
+
+    def _collect_review_data(self, date_str: str) -> dict:
+        """收集某日期的复盘数据，用于嵌入 JSON。"""
+        activities = self.db.get_date_activities(date_str)
         task_summary = self._summarize_activities(activities)
         total_sec = sum(task_summary.values())
         focus_sec = sum(v for k, v in task_summary.items() if not self._is_non_work_task(k))
@@ -4675,59 +5226,117 @@ class TimeTracker:
         task_rows = []
         for name, duration in sorted(task_summary.items(), key=lambda x: x[1], reverse=True):
             percent = int(duration / total_sec * 100) if total_sec else 0
-            task_rows.append(f"""
-            <div class=\"task-row\">
-                <div class=\"task-main\">
-                    <span>{html.escape(name)}</span>
-                    <strong>{self._fmt_duration(duration)}</strong>
-                </div>
-                <div class=\"bar\"><div style=\"width:{percent}%\"></div></div>
-            </div>
-            """)
+            task_rows.append({
+                "name": name,
+                "duration_str": self._fmt_duration(duration),
+                "percent": percent,
+            })
 
         timeline_rows = []
+        now = datetime.now()
         for act in activities:
-            start = datetime.fromisoformat(act.start_time)
-            end = datetime.fromisoformat(act.end_time) if act.end_time else now
-            title = html.escape(act.window_title or act.app_name or "")
-            timeline_rows.append(f"""
-            <div class=\"timeline-item\">
-                <div class=\"time\">{start.strftime('%H:%M')} - {end.strftime('%H:%M')}</div>
-                <div class=\"content\">
-                    <strong>{html.escape(act.task_name)}</strong>
-                    <span>{self._fmt_duration(act.duration)} · {html.escape(act.app_name or '')}</span>
-                    <p>{title}</p>
-                </div>
-            </div>
-            """)
+            try:
+                start = datetime.fromisoformat(act.start_time)
+                end = datetime.fromisoformat(act.end_time) if act.end_time else now
+            except Exception:
+                continue
+            timeline_rows.append({
+                "start": start.strftime('%H:%M'),
+                "end": end.strftime('%H:%M'),
+                "task_name": act.task_name,
+                "duration_str": self._fmt_duration(act.duration),
+                "app_name": act.app_name or "",
+                "title": act.window_title or act.app_name or "",
+            })
 
-        if not activities:
-            diagnosis = "今天还没有记录。先开始一次工作轨迹记录，再生成复盘。"
-            suggestion = "建议先建立今日任务，再开始追踪。"
-        elif away_sec > focus_sec:
-            diagnosis = "今天离开、休息或未归类时间偏多，需要检查是否有漏记任务。"
-            suggestion = "明天可以先列出 3 个重点任务，减少未归类时间。"
-        elif len(task_summary) >= 6:
-            diagnosis = "今天任务切换较多，可能存在碎片化工作。"
-            suggestion = "明天可以把相近任务合并，优先保证大块时间。"
+        # 休息对比：期望 = 完成专注单元数 × rest_per_pomodoro；实际 = away_sec（广义非工作）
+        unit_sec = max(1, config.get("pomodoro_minutes", 30)) * 60
+        completed_pomos = focus_sec // unit_sec
+        rest_per_sec = max(1, config.get("rest_per_pomodoro", 5)) * 60
+        expected_rest_sec = completed_pomos * rest_per_sec
+        rest_diff_sec = away_sec - expected_rest_sec
+        rest_threshold = 10 * 60
+        if abs(rest_diff_sec) <= rest_threshold:
+            rest_status = "正常"
+        elif rest_diff_sec < 0:
+            rest_status = "偏少，建议主动休息"
         else:
-            diagnosis = f"今天主要投入在“{top_task}”，整体记录比较集中。"
-            suggestion = "明天可以继续保持，结束工作后及时生成复盘。"
+            rest_status = "偏多"
+
+        return {
+            "date": date_str,
+            "has_data": bool(activities),
+            "total_sec": total_sec,
+            "focus_sec": focus_sec,
+            "away_sec": away_sec,
+            "total_str": self._fmt_duration(total_sec),
+            "focus_str": self._fmt_duration(focus_sec),
+            "away_str": self._fmt_duration(away_sec),
+            "top_task": top_task,
+            "efficiency": efficiency,
+            "task_rows": task_rows,
+            "timeline_rows": timeline_rows,
+            "completed_pomos": completed_pomos,
+            "rest_expected_sec": expected_rest_sec,
+            "rest_expected_str": self._fmt_duration(expected_rest_sec),
+            "rest_diff_sec": rest_diff_sec,
+            "rest_diff_str": ("+" if rest_diff_sec >= 0 else "-") + self._fmt_duration(abs(rest_diff_sec)),
+            "rest_status": rest_status,
+        }
+
+    def _build_review_html_doc(self, target_date: str, review_data: dict,
+                                all_dates: list, today_str: str) -> str:
+        """构建单 HTML 文件，内嵌 JSON 数据，JS 渲染。"""
+        import json as _json
+
+        now = datetime.now()
+        generated_at = now.strftime('%Y-%m-%d %H:%M')
+
+        data_json = _json.dumps(review_data, ensure_ascii=False).replace('</', r'<\/')
+        dates_json = _json.dumps(all_dates, ensure_ascii=False)
 
         html_doc = f"""<!doctype html>
-<html lang=\"zh-CN\">
+<html lang="zh-CN">
 <head>
-<meta charset=\"utf-8\">
-<title>WorkTrace 今日复盘</title>
+<meta charset="utf-8">
+<title>WorkTrace 工作复盘</title>
 <style>
 body {{ margin:0; background:#f4f6fb; color:#111827; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif; }}
 .container {{ max-width:1080px; margin:0 auto; padding:32px; }}
 .hero {{ background:linear-gradient(135deg,#111827,#374151); color:white; border-radius:28px; padding:32px; box-shadow:0 24px 60px rgba(17,24,39,.22); }}
 .hero p {{ color:#d1d5db; margin:8px 0 0; }}
+.nav-row {{ display:flex; align-items:center; gap:12px; margin:18px 0 0; flex-wrap:wrap; }}
+.nav-btn {{ display:inline-block; padding:10px 18px; background:rgba(255,255,255,.12); color:#fff; border:1px solid rgba(255,255,255,.25); border-radius:14px; text-decoration:none; font-weight:600; transition:background .2s; cursor:pointer; font-size:14px; font-family:inherit; }}
+.nav-btn:hover:not(:disabled) {{ background:rgba(255,255,255,.22); }}
+.nav-btn:disabled {{ opacity:.35; cursor:not-allowed; }}
+.date-picker {{ padding:8px 12px; background:rgba(255,255,255,.18); color:#fff; border:1px solid rgba(255,255,255,.25); border-radius:14px; font-weight:600; font-size:14px; font-family:inherit; flex:0 0 auto; cursor:pointer; }}
+.date-picker:hover {{ background:rgba(255,255,255,.28); }}
+.cal-popup {{ position:absolute; z-index:999; background:white; color:#111827; border-radius:16px; box-shadow:0 18px 48px rgba(15,23,42,.25); padding:14px; width:260px; font-size:13px; }}
+.cal-popup.hidden {{ display:none; }}
+.cal-header {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }}
+.cal-header button {{ background:#f3f4f6; border:0; border-radius:8px; padding:4px 10px; cursor:pointer; font-weight:700; color:#111827; font-family:inherit; }}
+.cal-header button:hover {{ background:#e5e7eb; }}
+.cal-header .title {{ font-weight:700; }}
+.cal-grid {{ display:grid; grid-template-columns:repeat(7,1fr); gap:2px; }}
+.cal-dow {{ text-align:center; color:#9ca3af; font-size:11px; padding:4px 0; }}
+.cal-cell {{ text-align:center; padding:6px 0; cursor:pointer; border-radius:8px; position:relative; font-weight:600; }}
+.cal-cell:hover {{ background:#eff6ff; }}
+.cal-cell.muted {{ color:#d1d5db; cursor:default; }}
+.cal-cell.muted:hover {{ background:transparent; }}
+.cal-cell.today {{ background:#2563eb; color:white; }}
+.cal-cell.today:hover {{ background:#1d4ed8; }}
+.cal-dot {{ width:4px; height:4px; border-radius:50%; margin:2px auto 0; }}
+.cal-dot.blue {{ background:#2563eb; }}
+.cal-dot.gray {{ background:#d1d5db; }}
+.cal-dot.none {{ background:transparent; }}
 .grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin:22px 0; }}
 .card {{ background:white; border-radius:22px; padding:22px; box-shadow:0 14px 36px rgba(15,23,42,.08); }}
 .card .label {{ color:#6b7280; font-size:13px; }}
 .card .value {{ font-size:28px; font-weight:800; margin-top:8px; }}
+.rest-compare {{ display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-top:8px; }}
+.rest-item {{ background:white; border-radius:18px; padding:16px; box-shadow:0 8px 24px rgba(15,23,42,.06); text-align:center; }}
+.rest-item .label {{ color:#6b7280; font-size:12px; }}
+.rest-item .value {{ font-size:20px; font-weight:800; margin-top:6px; }}
 .section {{ background:white; border-radius:24px; padding:24px; margin-top:18px; box-shadow:0 14px 36px rgba(15,23,42,.08); }}
 .section h2 {{ margin:0 0 16px; font-size:20px; }}
 .task-row {{ margin:14px 0; }}
@@ -4742,47 +5351,279 @@ body {{ margin:0; background:#f4f6fb; color:#111827; font-family:-apple-system,B
 .content strong {{ display:block; font-size:16px; }}
 .content span {{ display:block; color:#6b7280; margin-top:4px; }}
 .content p {{ color:#9ca3af; margin:6px 0 0; }}
-@media (max-width:800px) {{ .grid,.diagnosis {{ grid-template-columns:1fr; }} .timeline-item {{ grid-template-columns:1fr; }} }}
+.empty {{ text-align:center; padding:60px 20px; color:#9ca3af; }}
+.empty h2 {{ font-size:18px; margin:0 0 8px; color:#6b7280; }}
+.empty p {{ margin:6px 0; }}
+@media (max-width:800px) {{ .grid,.diagnosis,.rest-compare {{ grid-template-columns:1fr; }} .timeline-item {{ grid-template-columns:1fr; }} }}
 </style>
 </head>
 <body>
-<div class=\"container\">
-  <div class=\"hero\">
-    <h1>WorkTrace 今日复盘</h1>
-    <p>{now.strftime('%Y年%m月%d日 %H:%M')} 生成 · 本地报告</p>
-  </div>
-
-  <div class=\"grid\">
-    <div class=\"card\"><div class=\"label\">总记录时长</div><div class=\"value\">{self._fmt_duration(total_sec)}</div></div>
-    <div class=\"card\"><div class=\"label\">有效工作时间</div><div class=\"value\">{self._fmt_duration(focus_sec)}</div></div>
-    <div class=\"card\"><div class=\"label\">离开/休息时间</div><div class=\"value\">{self._fmt_duration(away_sec)}</div></div>
-    <div class=\"card\"><div class=\"label\">有效占比</div><div class=\"value\">{efficiency}%</div></div>
-  </div>
-
-  <div class=\"section\">
-    <h2>汇总与诊断</h2>
-    <div class=\"diagnosis\">
-      <div class=\"note\"><strong>一句话总结</strong><br>今天主要投入在“{html.escape(top_task)}”，有效工作时间 {self._fmt_duration(focus_sec)}。</div>
-      <div class=\"note\"><strong>AI 诊断占位</strong><br>{html.escape(diagnosis)}<br><br><strong>明日建议：</strong>{html.escape(suggestion)}</div>
+<div class="container">
+  <div class="hero">
+    <h1 id="title">WorkTrace 工作复盘</h1>
+    <p id="meta"></p>
+    <div class="nav-row">
+      <button class="nav-btn" id="prev-btn" type="button">← <span id="prev-label">前一天</span></button>
+      <button class="date-picker" id="date-picker-btn" type="button">{target_date}</button>
+      <button class="nav-btn" id="next-btn" type="button"><span id="next-label">后一天</span> -></button>
     </div>
+    <div id="cal-popup" class="cal-popup hidden"></div>
   </div>
-
-  <div class=\"section\">
-    <h2>任务时间排行</h2>
-    {''.join(task_rows) if task_rows else '<p>暂无任务记录</p>'}
-  </div>
-
-  <div class=\"section\">
-    <h2>时间线</h2>
-    {''.join(timeline_rows) if timeline_rows else '<p>暂无时间线记录</p>'}
-  </div>
+  <div id="content"></div>
 </div>
+<script>
+const REVIEW_DATA = {data_json};
+const ALL_DATES = {dates_json};
+const TODAY = "{today_str}";
+const GENERATED_AT = "{generated_at}";
+
+function escapeHtml(s) {{
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+}}
+
+function pad(n) {{ return n < 10 ? '0' + n : '' + n; }}
+function fmtDate(y, m, d) {{ return y + '-' + pad(m) + '-' + pad(d); }}
+function parseDate(s) {{
+  const p = s.split('-').map(x => parseInt(x, 10));
+  return {{ y: p[0], m: p[1], d: p[2] }};
+}}
+function shiftDate(s, deltaDays) {{
+  const {{ y, m, d }} = parseDate(s);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + deltaDays);
+  return fmtDate(dt.getFullYear(), dt.getMonth() + 1, dt.getDate());
+}}
+const EARLIEST = shiftDate(TODAY, -60);
+
+function findAdjacent(date) {{
+  const older = shiftDate(date, -1);
+  const newer = shiftDate(date, +1);
+  return {{
+    older: (older >= EARLIEST) ? older : null,
+    newer: (newer <= TODAY) ? newer : null,
+  }};
+}}
+
+const DATA_DATE_SET = new Set(ALL_DATES);
+let calViewYear = null, calViewMonth = null;
+let calOpen = false;
+
+function renderCalendar(viewDate) {{
+  const {{ y, m }} = parseDate(viewDate);
+  calViewYear = y; calViewMonth = m;
+  const popup = document.getElementById('cal-popup');
+  const monthNames = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+  const firstDay = new Date(y, m - 1, 1);
+  const firstWd = (firstDay.getDay() + 6) % 7;  // 周一=0
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const prevMonthDays = new Date(y, m - 1, 0).getDate();
+
+  let html = '<div class="cal-header">';
+  html += '<button id="cal-prev" type="button">&lt;</button>';
+  html += '<span class="title">' + y + '年' + monthNames[m - 1] + '</span>';
+  html += '<button id="cal-next" type="button">&gt;</button>';
+  html += '</div>';
+  html += '<div class="cal-grid">';
+  ['一','二','三','四','五','六','日'].forEach(d => {{ html += '<div class="cal-dow">' + d + '</div>'; }});
+  for (let i = 0; i < 42; i++) {{
+    let day, ds, isCur;
+    if (i < firstWd) {{
+      day = prevMonthDays - firstWd + i + 1;
+      const pm = m === 1 ? 12 : m - 1;
+      const py = m === 1 ? y - 1 : y;
+      ds = fmtDate(py, pm, day);
+      isCur = false;
+    }} else if (i < firstWd + daysInMonth) {{
+      day = i - firstWd + 1;
+      ds = fmtDate(y, m, day);
+      isCur = true;
+    }} else {{
+      day = i - firstWd - daysInMonth + 1;
+      const nm = m === 12 ? 1 : m + 1;
+      const ny = m === 12 ? y + 1 : y;
+      ds = fmtDate(ny, nm, day);
+      isCur = false;
+    }}
+    if (!isCur) {{
+      html += '<div class="cal-cell muted">' + day + '</div>';
+    }} else {{
+      const isToday = (ds === TODAY);
+      const isFuture = (ds > TODAY);
+      const hasData = DATA_DATE_SET.has(ds);
+      let dotClass = 'none';
+      if (!isFuture) dotClass = hasData ? 'blue' : 'gray';
+      const cls = 'cal-cell' + (isToday ? ' today' : '');
+      html += '<div class="' + cls + '" data-date="' + ds + '">' + day + '<div class="cal-dot ' + dotClass + '"></div></div>';
+    }}
+  }}
+  html += '</div>';
+  popup.innerHTML = html;
+  document.getElementById('cal-prev').onclick = function() {{
+    const nm = calViewMonth === 1 ? 12 : calViewMonth - 1;
+    const ny = calViewMonth === 1 ? calViewYear - 1 : calViewYear;
+    renderCalendar(fmtDate(ny, nm, 1));
+  }};
+  document.getElementById('cal-next').onclick = function() {{
+    const nm = calViewMonth === 12 ? 1 : calViewMonth + 1;
+    const ny = calViewMonth === 12 ? calViewYear + 1 : calViewYear;
+    renderCalendar(fmtDate(ny, nm, 1));
+  }};
+  Array.prototype.forEach.call(popup.querySelectorAll('.cal-cell[data-date]'), function(el) {{
+    el.onclick = function() {{
+      const ds = el.getAttribute('data-date');
+      render(ds);
+      closeCalendar();
+    }};
+  }});
+}}
+
+function openCalendar(currentDate) {{
+  const popup = document.getElementById('cal-popup');
+  const btn = document.getElementById('date-picker-btn');
+  renderCalendar(currentDate);
+  const rect = btn.getBoundingClientRect();
+  popup.style.left = rect.left + 'px';
+  popup.style.top = (rect.bottom + 6) + 'px';
+  popup.classList.remove('hidden');
+  calOpen = true;
+}}
+
+function closeCalendar() {{
+  document.getElementById('cal-popup').classList.add('hidden');
+  calOpen = false;
+}}
+
+function render(date) {{
+  currentDate = date;
+  const data = REVIEW_DATA[date];
+  const title = document.getElementById('title');
+  const meta = document.getElementById('meta');
+  const content = document.getElementById('content');
+  const datePickerBtn = document.getElementById('date-picker-btn');
+  const prevBtn = document.getElementById('prev-btn');
+  const prevLabel = document.getElementById('prev-label');
+  const nextBtn = document.getElementById('next-btn');
+  const nextLabel = document.getElementById('next-label');
+
+  datePickerBtn.textContent = date;
+  // 如果日历开着，刷新它的月份到当前日期
+  if (calOpen) renderCalendar(date);
+
+  const isToday = (date === TODAY);
+  title.textContent = isToday ? "WorkTrace 今日复盘" : "WorkTrace 工作复盘";
+
+  const adj = findAdjacent(date);
+  if (adj.older) {{
+    prevBtn.disabled = false;
+    prevBtn.onclick = () => render(adj.older);
+    prevLabel.textContent = adj.older;
+  }} else {{
+    prevBtn.disabled = true;
+    prevBtn.onclick = null;
+    prevLabel.textContent = '已到最早';
+  }}
+  if (adj.newer) {{
+    nextBtn.disabled = false;
+    nextBtn.onclick = () => render(adj.newer);
+    nextLabel.textContent = adj.newer === TODAY ? '今日复盘' : adj.newer;
+  }} else {{
+    nextBtn.disabled = true;
+    nextBtn.onclick = null;
+    nextLabel.textContent = '已是最新';
+  }}
+
+  const parts = date.split('-');
+  const dateText = parts[0] + '年' + parseInt(parts[1], 10) + '月' + parseInt(parts[2], 10) + '日';
+  meta.textContent = dateText + ' 复盘 · ' + GENERATED_AT + ' 生成 · 本地报告';
+
+  if (!data || !data.has_data) {{
+    content.innerHTML =
+      '<div class="section empty">' +
+      '<h2>无数据</h2>' +
+      '<p>' + escapeHtml(date) + ' 没有工作轨迹记录。</p>' +
+      '<p style="margin-top:8px;font-size:13px;">可通过上方日期选择器或前后按钮切换其他日期。</p>' +
+      '</div>';
+    return;
+  }}
+
+  let diagnosis, suggestion;
+  if (data.away_sec > data.focus_sec) {{
+    diagnosis = date + ' 离开、休息或未归类时间偏多，需要检查是否有漏记任务。';
+    suggestion = '次日可以先列出 3 个重点任务，减少未归类时间。';
+  }} else if (data.task_rows.length >= 6) {{
+    diagnosis = date + ' 任务切换较多，可能存在碎片化工作。';
+    suggestion = '次日可以把相近任务合并，优先保证大块时间。';
+  }} else {{
+    diagnosis = date + ' 主要投入在“' + data.top_task + '”，整体记录比较集中。';
+    suggestion = '次日可以继续保持，结束工作后及时生成复盘。';
+  }}
+
+  const taskRowsHtml = data.task_rows.length ? data.task_rows.map(function(r) {{
+    return '<div class="task-row">' +
+      '<div class="task-main"><span>' + escapeHtml(r.name) + '</span><strong>' + escapeHtml(r.duration_str) + '</strong></div>' +
+      '<div class="bar"><div style="width:' + r.percent + '%"></div></div>' +
+      '</div>';
+  }}).join('') : '<p>暂无任务记录</p>';
+
+  const timelineHtml = data.timeline_rows.length ? data.timeline_rows.map(function(r) {{
+    return '<div class="timeline-item">' +
+      '<div class="time">' + escapeHtml(r.start) + ' - ' + escapeHtml(r.end) + '</div>' +
+      '<div class="content">' +
+      '<strong>' + escapeHtml(r.task_name) + '</strong>' +
+      '<span>' + escapeHtml(r.duration_str) + ' · ' + escapeHtml(r.app_name) + '</span>' +
+      '<p>' + escapeHtml(r.title) + '</p>' +
+      '</div></div>';
+  }}).join('') : '<p>暂无时间线记录</p>';
+
+  const restStatusColor = data.rest_status === '正常' ? '#10b981'
+    : (data.rest_status.indexOf('偏少') >= 0 ? '#ef4444' : '#f59e0b');
+
+  content.innerHTML =
+    '<div class="grid">' +
+    '<div class="card"><div class="label">总记录时长</div><div class="value">' + escapeHtml(data.total_str) + '</div></div>' +
+    '<div class="card"><div class="label">有效工作时长</div><div class="value">' + escapeHtml(data.focus_str) + '</div></div>' +
+    '<div class="card"><div class="label">离开/休息时长</div><div class="value">' + escapeHtml(data.away_str) + '</div></div>' +
+    '<div class="card"><div class="label">有效工作占比</div><div class="value">' + data.efficiency + '%</div></div>' +
+    '</div>' +
+    '<div class="section"><h2>休息对比</h2>' +
+    '<div class="rest-compare">' +
+    '<div class="rest-item"><div class="label">完成专注单元</div><div class="value">' + data.completed_pomos + ' 轮</div></div>' +
+    '<div class="rest-item"><div class="label">期望休息</div><div class="value">' + escapeHtml(data.rest_expected_str) + '</div></div>' +
+    '<div class="rest-item"><div class="label">实际休息</div><div class="value">' + escapeHtml(data.away_str) + '</div></div>' +
+    '<div class="rest-item"><div class="label">偏差</div><div class="value">' + escapeHtml(data.rest_diff_str) + '</div></div>' +
+    '<div class="rest-item"><div class="label">状态</div><div class="value" style="color:' + restStatusColor + '">' + escapeHtml(data.rest_status) + '</div></div>' +
+    '</div></div>' +
+    '<div class="section"><h2>汇总与诊断</h2><div class="diagnosis">' +
+    '<div class="note"><strong>一句话总结</strong><br>' + escapeHtml(date) + ' 主要投入在“' + escapeHtml(data.top_task) + '”，有效工作时间 ' + escapeHtml(data.focus_str) + '。</div>' +
+    '<div class="note"><strong>AI 诊断占位</strong><br>' + escapeHtml(diagnosis) + '<br><br><strong>次日建议：</strong>' + escapeHtml(suggestion) + '</div>' +
+    '</div></div>' +
+    '<div class="section"><h2>任务时间排行</h2>' + taskRowsHtml + '</div>' +
+    '<div class="section"><h2>时间线</h2>' + timelineHtml + '</div>';
+}}
+
+let currentDate = "{target_date}";
+document.getElementById('date-picker-btn').addEventListener('click', function(e) {{
+  e.stopPropagation();
+  if (calOpen) closeCalendar(); else openCalendar(currentDate);
+}});
+
+document.addEventListener('click', function(e) {{
+  if (!calOpen) return;
+  const popup = document.getElementById('cal-popup');
+  if (!popup.contains(e.target) && e.target.id !== 'date-picker-btn') {{
+    closeCalendar();
+  }}
+}});
+
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape' && calOpen) closeCalendar();
+}});
+
+render(currentDate);
+</script>
 </body>
 </html>"""
-
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write(html_doc)
-        return report_path
+        return html_doc
 
     def _summarize_activities(self, activities: List[Activity]) -> Dict[str, int]:
         task_summary = {}
@@ -4841,6 +5682,47 @@ body {{ margin:0; background:#f4f6fb; color:#111827; font-family:-apple-system,B
                 pass
         return focus_total // unit
 
+    def get_date_completed_pomodoros(self, date_str: str) -> int:
+        """指定日期完成的专注单元数 = 当日有效工作时长 ÷ 专注单元时长"""
+        unit = max(1, config.get("pomodoro_minutes", 30)) * 60
+        focus_total = 0
+        try:
+            activities = self.db.get_date_activities(date_str)
+            for act in activities:
+                if not act.is_idle and not act.is_locked and not self._is_non_work_task(act.task_name):
+                    focus_total += act.duration
+        except Exception:
+            pass
+        return focus_total // unit
+
+    def compute_rest_comparison(self, date_str: str) -> dict:
+        """计算指定日期的休息对比数据。
+        - 期望休息 = 完成的专注单元数 × rest_per_pomodoro 分钟
+        - 实际休息 = 任务名含「休息/离开/锁屏」的活动时长合计（广义）
+        - 偏差阈值 ±10 分钟判定为"正常"
+        """
+        activities = self.db.get_date_activities(date_str)
+        task_summary = self._summarize_activities(activities)
+        actual_rest_sec = sum(v for k, v in task_summary.items() if self._is_non_work_task(k))
+        completed_pomos = self.get_date_completed_pomodoros(date_str)
+        rest_per = max(1, config.get("rest_per_pomodoro", 5)) * 60
+        expected_rest_sec = completed_pomos * rest_per
+        diff_sec = actual_rest_sec - expected_rest_sec
+        threshold = 10 * 60
+        if abs(diff_sec) <= threshold:
+            status = "正常"
+        elif diff_sec < 0:
+            status = "偏少"
+        else:
+            status = "偏多"
+        return {
+            "completed_pomos": completed_pomos,
+            "expected_rest_sec": expected_rest_sec,
+            "actual_rest_sec": actual_rest_sec,
+            "diff_sec": diff_sec,
+            "status": status,
+        }
+
     def get_no_input_seconds(self) -> int:
         return self.today_no_input_seconds
 
@@ -4852,16 +5734,13 @@ def main():
     
     tracker = TimeTracker()
 
-    # 静默启动模式
-    silent = config.get("silent_start", False)
-
     # 启动控制面板（主线程）
-    panel = ControlPanel(tracker, silent=silent)
+    panel = ControlPanel(tracker)
 
     # 给 tracker 设置 panel 引用，用于线程安全的 UI 调度
     tracker.panel = panel
 
-    # 自动开始追踪（在 panel 创建后，确保 UI 可用）
+    # 启动后自动记录（在 panel 创建后，确保 UI 可用）
     if config.get("auto_start_track", True):
         tracker.start()
 
