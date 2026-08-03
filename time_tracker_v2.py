@@ -45,7 +45,13 @@ IDM_SHOW = 1001             # 菜单：打开面板
 IDM_QUIT = 1002             # 菜单：退出
 
 # ========== 配置 ==========
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    # PyInstaller 打包后：exe 同目录存用户数据（config/db/log），_MEIPASS 存打包资源（icons）
+    SCRIPT_DIR = os.path.dirname(sys.executable)
+    _BUNDLE_DIR = sys._MEIPASS
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    _BUNDLE_DIR = SCRIPT_DIR
 DB_PATH = os.path.join(SCRIPT_DIR, "time_tracker.db")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
@@ -167,7 +173,7 @@ class ScaledCanvas(tk.Canvas):
 
 # 修复 Windows 控制台编码，并兼容 pythonw.exe 无控制台启动
 if sys.platform == 'win32':
-    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worktrace_start.log")
+    log_path = os.path.join(SCRIPT_DIR, "worktrace_start.log")
     if getattr(sys.stdout, 'buffer', None):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     else:
@@ -199,9 +205,10 @@ DEFAULT_CONFIG = {
     # AI 内容感知偏离判定
     "ai_enabled": True,             # 是否启用 AI 内容判定（关闭则退回进程名兜底）
     "body_send": True,              # 是否把正文摘要外发给 AI（关闭则只发标题+网址）
-    "ark_api_key": "",              # 火山方舟 API Key —— 留空，真实 key 写入本地 config.json（已 gitignore）
-    "ark_endpoint": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
-    "ark_model": "ep-20260604101325-f2wcq"
+    "ark_api_key": "",              # 邀请码（中转服务鉴权用）-- 留空，真实邀请码写入本地 config.json
+    "ark_endpoint": "http://localhost:8000/api/v3/chat/completions",  # 中转服务地址
+    "ark_model": "ep-20260604101325-f2wcq",
+    "invite_prompted": False       # 是否已弹过首次邀请码引导（只弹一次，之后用户去设置里改）
 }
 
 # ========== Cyberpunk 主题色板 ==========
@@ -293,13 +300,18 @@ def _apply_auto_launch(enabled):
         import winreg
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         app_name = "TimeTracker"
-        script_path = os.path.join(SCRIPT_DIR, "time_tracker_v2.py")
-        pythonw_path = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        if not os.path.exists(pythonw_path):
-            pythonw_path = sys.executable
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         if enabled:
-            launch_cmd = f'"{pythonw_path}" "{script_path}"'
+            if getattr(sys, 'frozen', False):
+                # 打包后：直接用 exe 路径
+                launch_cmd = f'"{sys.executable}"'
+            else:
+                # 源码模式：pythonw + script
+                script_path = os.path.join(SCRIPT_DIR, "time_tracker_v2.py")
+                pythonw_path = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                if not os.path.exists(pythonw_path):
+                    pythonw_path = sys.executable
+                launch_cmd = f'"{pythonw_path}" "{script_path}"'
             winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, launch_cmd)
         else:
             try:
@@ -488,8 +500,8 @@ def _place_overlay(win, parent, w, h):
 
 
 def _asset(name):
-    """脚本同级 icons/ 下资源的绝对路径。"""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icons', name)
+    """资源绝对路径。源码模式下用 SCRIPT_DIR/icons，PyInstaller 打包后用 _MEIPASS/icons。"""
+    return os.path.join(_BUNDLE_DIR, 'icons', name)
 
 
 @dataclass
@@ -1048,7 +1060,7 @@ class ArkClient:
                 self.endpoint,
                 data=json.dumps(payload).encode('utf-8'),
                 headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {self.api_key}"},
+                         "X-Invite-Code": self.api_key},
                 method="POST")
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read().decode('utf-8'))
@@ -1537,7 +1549,11 @@ class ModernDialog:
                  font=('Microsoft YaHei', 9, 'bold'),
                  bg=t["cream"], fg=t["muted"], anchor='w').pack(fill='x')
 
-        tk.Label(inner, text="请选择要切换的任务，或在下方创建新任务。双击任务，或选中后按 Enter 确认。",
+        if self.options:
+            guide = "请选择要切换的任务，或在下方创建新任务。双击任务，或选中后按 Enter 确认。"
+        else:
+            guide = "暂无任务。在下方输入任务名后按 Enter 创建第一个任务。"
+        tk.Label(inner, text=guide,
                  font=('Microsoft YaHei', 8, 'bold'),
                  bg=t["cream"], fg=t["black"], anchor='w').pack(fill='x', padx=_S(14), pady=(_S(0), _S(8)))
 
@@ -1579,8 +1595,8 @@ class ModernDialog:
             empty = tk.Frame(options_wrap, bg=t["cream"], highlightthickness=3,
                              highlightbackground=t["black"])
             empty.pack(fill='x', pady=(_S(0), _S(8)))
-            tk.Label(empty, text="NO TASKS · ADD BELOW",
-                     font=('JetBrains Mono', 10, 'bold'),
+            tk.Label(empty, text="暂无任务 · 在下方输入新建",
+                     font=('Microsoft YaHei', 10, 'bold'),
                      bg=t["cream"], fg=t["red"]).pack(pady=_S(15))
 
         self.input_wrap = tk.Frame(inner, bg=t["cream"], highlightthickness=3,
@@ -2005,8 +2021,8 @@ class ModernDialog:
             empty = tk.Frame(wrap, bg=t["cream"], highlightthickness=3,
                              highlightbackground=t["black"])
             empty.pack(fill='x', pady=(_S(0), _S(8)))
-            tk.Label(empty, text="NO TASKS · ADD BELOW",
-                     font=('JetBrains Mono', 10, 'bold'),
+            tk.Label(empty, text="暂无任务 · 在下方输入新建",
+                     font=('Microsoft YaHei', 10, 'bold'),
                      bg=t["cream"], fg=t["red"]).pack(pady=_S(15))
         if getattr(self, '_options_canvas', None):
             self._options_canvas.update_idletasks()
@@ -2018,6 +2034,52 @@ class ModernDialog:
         _win_set_topmost(self.root, True)
         self._parent.wait_window(self.root)
         return self.result
+
+
+_PRIVACY_POLICY_TEXT = """【WorkTrace 隐私政策】
+
+最后更新：2026-08-03
+
+■ 1. 我们抓什么数据
+WorkTrace 在你使用过程中会读取当前活跃窗口的以下信息：
+  - 应用程序名（如 chrome.exe、wechat.exe）
+  - 窗口标题
+  - 网址（仅浏览器窗口，通过 Windows UIA 接口读取）
+  - 网页正文摘要（仅浏览器窗口，前 80 字符，可在设置中关闭）
+
+■ 2. 我们存什么数据
+以下数据仅保存在你本地电脑的 time_tracker.db：
+  - 活动记录：应用名、窗口标题、网址、起止时间、时长
+  - 任务列表、关键词
+  - 系统统计：今日总专注、休息、空闲时长
+
+■ 3. 我们发送什么到 AI
+当"内容感知偏离"开关打开时，以下信息会经中转服务转发到 AI：
+  - 当前任务名、关键词
+  - 当前窗口的应用名、标题、网址
+  - 网页正文摘要（前 80 字符，关闭"正文外发"则不发）
+
+■ 4. 中转服务不存什么
+中转服务不存储你的窗口内容、网址或正文，
+只统计调用次数和 token 数用于计费和限额。
+中转服务位于运营者（你邀请码的发放者）的服务器上。
+
+■ 5. 数据流向
+客户端 -> 中转服务（不存内容，只统计）-> AI provider（火山方舟/DeepSeek 等）
+
+■ 6. 你可以怎么关闭
+  - 关闭"内容感知偏离"：完全不发任何数据到 AI，仅用进程名启发式判定
+  - 关闭"正文外发"：仍发任务名/标题/网址，但不发正文摘要
+  - 邀请码弹窗选"不用 AI"：同时关闭以上两个开关
+  - 完全卸载：删除 WorkTrace 目录及 time_tracker.db 即可彻底清除本地数据
+
+■ 7. 邀请码用途
+邀请码仅用于中转服务的流量鉴权和限额，不绑定你的身份信息。
+不同邀请码独立计数，可在管理后台查看用量。
+
+■ 8. 联系方式
+如对隐私政策有疑问，请联系你的邀请码发放者。
+"""
 
 
 class SettingsWindow:
@@ -2041,6 +2103,7 @@ class SettingsWindow:
         self._vars = {}
         self._sliders = {}      # key -> {'canvas','draw','val_lbl','min','max','step','unit'}
         self._toggles = {}      # key -> {'canvas','draw'}
+        self._entries = {}      # key -> tk.Entry
         self._orig_auto_launch = bool(cfg.get("auto_launch", False))
 
         t = self.theme()
@@ -2158,6 +2221,12 @@ class SettingsWindow:
         self._make_plate(content, "AI 判定")
         self._make_toggle(content, "内容感知偏离", "ai_enabled")
         self._make_toggle(content, "正文外发", "body_send")
+        self._make_input(content, "邀请码", "ark_api_key",
+                        "WorkTrace 通过中转服务调用 AI，请输入你拿到的邀请码（形如 WT-XXXXXX）。"
+                        "没有邀请码时关闭右侧的'内容感知偏离'即可继续使用其余功能。")
+        self._make_input(content, "中转地址", "ark_endpoint",
+                        "中转服务的 HTTP 地址。默认 http://localhost:8000/api/v3/chat/completions。"
+                        "运营者换公网穿透地址时改这里，无需重新打包 exe。")
 
         tk.Frame(bd, bg=t["black"], height=4).pack(fill='x', pady=(_S(8), _S(0)))
 
@@ -2169,6 +2238,8 @@ class SettingsWindow:
 
         self._make_metal_btn(inner_btn, "恢复默认", self._reset_defaults,
                              kind='danger').pack(side='left')
+        self._make_metal_btn(inner_btn, "隐私政策", self._show_privacy,
+                             kind='normal').pack(side='left', padx=(_S(8), _S(0)))
 
         right_box = tk.Frame(inner_btn, bg=t["cream"])
         right_box.pack(side='right')
@@ -2329,6 +2400,36 @@ class SettingsWindow:
         draw()
         self._toggles[key] = {'canvas': c, 'draw': draw}
 
+    def _make_input(self, parent, label, key, help_text=None):
+        """单行文本输入。存到 self._vars[key]（StringVar），保存时直接落到 cfg[key]。"""
+        t = self.theme()
+        row = tk.Frame(parent, bg=t["white"])
+        row.pack(fill='x', pady=_S(6))
+
+        label_box = tk.Frame(row, bg=t["white"], width=_S(90), height=_S(28))
+        label_box.pack(side='left')
+        label_box.pack_propagate(False)
+        tk.Label(label_box, text=label, font=('Microsoft YaHei', 9, 'bold'),
+                 bg=t["white"], fg=t["black"], anchor='w').pack(side='left')
+        if help_text:
+            help_lbl = tk.Label(label_box, text="?", font=('JetBrains Mono', 8, 'bold'),
+                                bg=t["yellow"], fg=t["black"], width=2, cursor='question_arrow',
+                                highlightthickness=2, highlightbackground=t["black"])
+            help_lbl.pack(side='left', padx=(_S(5), _S(0)))
+            help_lbl.bind('<Enter>', lambda e, txt=help_text: self._show_help_tip(e.widget, txt))
+            help_lbl.bind('<Leave>', lambda e: self._hide_help_tip())
+
+        var = tk.StringVar(value=str(self.cfg.get(key, "") or ""))
+        entry = tk.Entry(row, textvariable=var, font=('JetBrains Mono', 9, 'bold'),
+                        bg=t["cream"], fg=t["black"],
+                        insertbackground=t["teal"],
+                        relief='flat', bd=0,
+                        width=22)
+        entry.pack(side='right', fill='x', expand=True, padx=(_S(6), _S(8)))
+        self._vars[key] = var
+        self._entries[key] = entry
+        return entry
+
     def _make_metal_btn(self, parent, text, on_click, kind='normal'):
         t = self.theme()
         if kind == 'primary':
@@ -2392,6 +2493,65 @@ class SettingsWindow:
                 info['draw']()
         for key, info in self._toggles.items():
             info['draw']()
+        for key, entry in self._entries.items():
+            v = self._vars.get(key)
+            if v is not None:
+                entry.delete(0, 'end')
+                entry.insert(0, v.get())
+
+    def _show_privacy(self):
+        """弹出隐私政策 Toplevel。"""
+        t = self.theme()
+        win = tk.Toplevel(self.win)
+        win.title("PRIVACY")
+        win.overrideredirect(True)
+        win.configure(bg=t["cream"])
+        win.attributes('-topmost', True)
+        win.update_idletasks()
+        w, h = _S(440), _S(560)
+        _place_centered(win, self.win, w, h)
+
+        bd = tk.Frame(win, bg=t["cream"], highlightthickness=4,
+                      highlightbackground=t["black"])
+        bd.pack(fill='both', expand=True)
+
+        hdr = tk.Frame(bd, bg=t["yellow"], highlightthickness=0)
+        hdr.pack(fill='x')
+        title_box = tk.Frame(hdr, bg=t["yellow"], padx=_S(12), pady=_S(10))
+        title_box.pack(side='left', fill='x', expand=True)
+        tk.Label(title_box, text="隐私政策", font=('JetBrains Mono', 14, 'bold'),
+                 bg=t["yellow"], fg=t["black"], anchor='w').pack(side='left')
+        close_lbl = tk.Label(hdr, text="×", font=('JetBrains Mono', 13, 'bold'),
+                             bg=t["red"], fg=t["white"], width=3, cursor='hand2')
+        close_lbl.pack(side='right', fill='y')
+        close_lbl.bind('<Button-1>', lambda e: win.destroy())
+        close_lbl.bind('<Enter>', lambda e, l=close_lbl: l.config(bg=t["black"], fg=t["yellow"]))
+        close_lbl.bind('<Leave>', lambda e, l=close_lbl: l.config(bg=t["red"], fg=t["white"]))
+
+        tk.Frame(bd, bg=t["black"], height=_S(4)).pack(fill='x')
+
+        text_frame = tk.Frame(bd, bg=t["cream"])
+        text_frame.pack(fill='both', expand=True, padx=_S(12), pady=_S(12))
+        text = tk.Text(text_frame, font=('Microsoft YaHei', 9),
+                      bg=t["white"], fg=t["black"],
+                      relief='flat', bd=0, wrap='word',
+                      padx=_S(10), pady=_S(10),
+                      highlightthickness=2, highlightbackground=t["black"])
+        sb = tk.Scrollbar(text_frame, command=text.yview)
+        text.configure(yscrollcommand=sb.set)
+        text.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        text.insert('1.0', _PRIVACY_POLICY_TEXT)
+        text.configure(state='disabled')
+
+        btn_row = tk.Frame(bd, bg=t["cream"], padx=_S(12), pady=_S(12))
+        btn_row.pack(fill='x')
+        self._make_metal_btn(btn_row, "我知道了", win.destroy,
+                             kind='primary').pack(side='right')
+
+        win.bind('<Escape>', lambda e: win.destroy())
+        _bind_title_drag(win, hdr)
+        _win_set_topmost(win, True)
 
 
 class _DatePickerWindow:
@@ -4360,6 +4520,10 @@ class ControlPanel:
         self.tracker.no_input_threshold = config.get("no_input_threshold", 180)
         self.tracker.auto_end_threshold = config.get("auto_end_threshold", 3600)
         self.tracker.auto_start_new_day = config.get("auto_start_new_day", False)
+        # 邀请码 / endpoint 改动后让 ArkClient 立即生效，无需重启
+        self.tracker.ai_enabled = config.get("ai_enabled", True)
+        self.tracker.body_send = config.get("body_send", True)
+        self.tracker.ark = ArkClient(config)
         if not config.get("edge_hide", False) and self._edge_state != 'free':
             self._enter_free()
         else:
@@ -4552,6 +4716,9 @@ class TimeTracker:
         self.running = True
         # auto_start_track=True 视作"启动即开始今日工作"；否则保持 pending 等用户主动开始
         self.work_session = 'active'
+        # 启动即视为"刚提醒过"，避免 track_loop 第一次循环就因 last_reminder_time=0 立刻补弹
+        # _prompt_select_task 关闭后若用户没选任务，也会再刷新一次，给一个完整 reminder_interval 喘息
+        self.last_reminder_time = time.time()
         self._load_today_tasks()
 
         self.track_thread = threading.Thread(target=self._track_loop)
@@ -4592,18 +4759,26 @@ class TimeTracker:
             return
         if not self.panel:
             return
-        window_info = WindowTracker.get_active_window_info()
-        options = [task.name for task in self.today_tasks]
-        task_ids = [task.id for task in self.today_tasks]
-        # 休息/娱乐放最后一项（idx>=len(task_ids)，自动不带改/删按钮，也不会成为默认选中行）
-        options.append("休息/娱乐")
-        msg = "请选择你现在要做的任务："
-        dialog = ModernDialog(self.panel.root, "选择任务", msg, options,
-                             task_ids=task_ids,
-                             on_task_edit=self._on_task_edit,
-                             on_task_delete=self._on_task_delete_confirm)
-        result = dialog.show()
-        self._process_task_selection(result, window_info)
+        self._dialog_active = True
+        try:
+            window_info = WindowTracker.get_active_window_info()
+            options = [task.name for task in self.today_tasks]
+            task_ids = [task.id for task in self.today_tasks]
+            # 休息/娱乐放最后一项（idx>=len(task_ids)，自动不带改/删按钮，也不会成为默认选中行）
+            options.append("休息/娱乐")
+            msg = "请选择你现在要做的任务："
+            dialog = ModernDialog(self.panel.root, "选择任务", msg, options,
+                                 task_ids=task_ids,
+                                 on_task_edit=self._on_task_edit,
+                                 on_task_delete=self._on_task_delete_confirm)
+            result = dialog.show()
+            self._process_task_selection(result, window_info)
+            # 用户关掉弹窗但没选任务：刷新 last_reminder_time，给一个完整 reminder_interval 喘息，
+            # 否则 track_loop 会在下个周期立刻补弹第二个"任务确认"对话框
+            if not result and not self.current_task:
+                self.last_reminder_time = time.time()
+        finally:
+            self._dialog_active = False
 
     def _on_task_edit(self, task_id: str, new_name: str):
         """弹窗内修改任务名称的回调"""
@@ -5727,11 +5902,136 @@ render(currentDate);
         return self.today_no_input_seconds
 
 
+def _prompt_invite_code(parent, tracker, on_done=None):
+    """启动时若 ark_api_key 为空，弹出 Memphis 风格 Modal 让用户输入邀请码。
+    用户选"不用 AI"则同步关闭 ai_enabled；选"确定"则保存邀请码并重建 ArkClient。
+    on_done(no_ai: bool) 在动作完成后回调（用于继续后续启动流程）。"""
+    t = theme()
+    win = tk.Toplevel(parent)
+    win.title("邀请码")
+    win.overrideredirect(True)
+    win.configure(bg=t["cream"])
+    win.attributes('-topmost', True)
+    win.update_idletasks()
+    w, h = _S(360), _S(260)
+    _place_centered(win, parent, w, h)
+
+    bd = tk.Frame(win, bg=t["cream"], highlightthickness=4,
+                  highlightbackground=t["black"])
+    bd.pack(fill='both', expand=True)
+
+    # 标题栏 - 与 SettingsWindow 一致
+    hdr = tk.Frame(bd, bg=t["yellow"], highlightthickness=0)
+    hdr.pack(fill='x')
+    title_box = tk.Frame(hdr, bg=t["yellow"], padx=_S(12), pady=_S(10))
+    title_box.pack(side='left', fill='x', expand=True)
+    rivet = ScaledCanvas(title_box, width=11, height=11, bg=t["yellow"], highlightthickness=0)
+    rivet.pack(side='left', padx=(_S(0), _S(8)))
+    rivet.create_oval(1, 1, 10, 10, fill=t["black"], outline='')
+    tk.Label(title_box, text="邀请码", font=('JetBrains Mono', 14, 'bold'),
+             bg=t["yellow"], fg=t["black"], anchor='w').pack(side='left')
+
+    result = {"done": False, "no_ai": False}
+
+    def _close(no_ai: bool):
+        if result["done"]:
+            return
+        result["done"] = True
+        result["no_ai"] = no_ai
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        if on_done:
+            on_done(no_ai)
+
+    close_lbl = tk.Label(hdr, text="×", font=('JetBrains Mono', 13, 'bold'),
+                         bg=t["red"], fg=t["white"], width=3, cursor='hand2')
+    close_lbl.pack(side='right', fill='y')
+    close_lbl.bind('<Button-1>', lambda e: _close(True))
+    close_lbl.bind('<Enter>', lambda e, l=close_lbl: l.config(bg=t["black"], fg=t["yellow"]))
+    close_lbl.bind('<Leave>', lambda e, l=close_lbl: l.config(bg=t["red"], fg=t["white"]))
+
+    tk.Frame(bd, bg=t["black"], height=_S(4)).pack(fill='x')
+
+    # 正文
+    body = tk.Frame(bd, bg=t["cream"], padx=_S(18), pady=_S(16))
+    body.pack(fill='both', expand=True)
+    tk.Label(body, text="输入你拿到的邀请码以启用 AI 内容感知偏离判定。",
+             font=('Microsoft YaHei', 9, 'bold'),
+             bg=t["cream"], fg=t["black"], wraplength=_S(300), justify='left',
+             anchor='w').pack(fill='x', pady=(_S(0), _S(4)))
+    tk.Label(body, text="没有邀请码？也可选\"不用 AI\"继续使用其余功能。\n之后可在 设置 → AI 判定 中随时输入或修改邀请码。",
+             font=('Microsoft YaHei', 8),
+             bg=t["cream"], fg=t["ink_3"], wraplength=_S(300), justify='left',
+             anchor='w').pack(fill='x', pady=(_S(0), _S(10)))
+
+    var = tk.StringVar(value="")
+    entry = tk.Entry(body, textvariable=var, font=('JetBrains Mono', 10, 'bold'),
+                    bg=t["white"], fg=t["black"],
+                    insertbackground=t["teal"],
+                    relief='flat', bd=0,
+                    highlightthickness=2, highlightbackground=t["black"])
+    entry.pack(fill='x', ipady=_S(6), pady=(_S(0), _S(8)))
+    entry.focus_set()
+
+    def _confirm():
+        code = var.get().strip()
+        if not code:
+            return
+        config["ark_api_key"] = code
+        config["invite_prompted"] = True
+        save_config(config)
+        tracker.ark = ArkClient(config)
+        tracker.ai_enabled = True
+        _close(False)
+
+    entry.bind('<Return>', lambda e: _confirm())
+    entry.bind('<Escape>', lambda e: _close(True))
+
+    # 底部按钮
+    btn_row = tk.Frame(bd, bg=t["cream"], padx=_S(12), pady=_S(12))
+    btn_row.pack(fill='x')
+    right = tk.Frame(btn_row, bg=t["cream"])
+    right.pack(side='right')
+
+    skip_btn = tk.Label(btn_row, text="不用 AI", font=('Microsoft YaHei', 9, 'bold'),
+                        bg=t["white"], fg=t["black"], padx=_S(14), pady=_S(6),
+                        relief='flat', cursor='hand2',
+                        highlightthickness=3, highlightbackground=t["black"])
+    skip_btn.pack(side='left')
+    skip_btn.bind('<Button-1>', lambda e: _close_no_ai())
+    skip_btn.bind('<Enter>', lambda e, b=skip_btn: b.config(bg=t["yellow"], fg=t["black"]))
+    skip_btn.bind('<Leave>', lambda e, b=skip_btn: b.config(bg=t["white"], fg=t["black"]))
+
+    def _close_no_ai():
+        config["ai_enabled"] = False
+        config["body_send"] = False
+        config["invite_prompted"] = True
+        save_config(config)
+        tracker.ai_enabled = False
+        tracker.body_send = False
+        _close(True)
+
+    ok_btn = tk.Label(right, text="确定", font=('Microsoft YaHei', 9, 'bold'),
+                      bg=t["teal"], fg=t["black"], padx=_S(14), pady=_S(6),
+                      relief='flat', cursor='hand2',
+                      highlightthickness=3, highlightbackground=t["black"])
+    ok_btn.pack(side='left')
+    ok_btn.bind('<Button-1>', lambda e: _confirm())
+    ok_btn.bind('<Enter>', lambda e, b=ok_btn: b.config(bg=t["yellow"], fg=t["black"]))
+    ok_btn.bind('<Leave>', lambda e, b=ok_btn: b.config(bg=t["teal"], fg=t["black"]))
+
+    _bind_title_drag(win, hdr)
+    _win_set_topmost(win, True)
+    return win
+
+
 def main():
     print("=" * 50)
     print("[WorkTrace 工作轨迹] - 本地记录与复盘")
     print("=" * 50)
-    
+
     tracker = TimeTracker()
 
     # 启动控制面板（主线程）
@@ -5739,6 +6039,12 @@ def main():
 
     # 给 tracker 设置 panel 引用，用于线程安全的 UI 调度
     tracker.panel = panel
+
+    # 首次启动 / 邀请码缺失且从未引导过时，弹一次引导窗
+    if not config.get("ark_api_key") and not config.get("invite_prompted"):
+        def _show_invite():
+            _prompt_invite_code(panel.root, tracker)
+        panel.root.after(600, _show_invite)
 
     # 启动后自动记录（在 panel 创建后，确保 UI 可用）
     if config.get("auto_start_track", True):

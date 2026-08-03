@@ -23,6 +23,16 @@ __pycache__/
 *.pyc
 *.pyo
 
+# PyInstaller 打包产物
+dist/
+dist2/
+build/
+build2/
+*.spec.bak
+
+# 备份
+*.bak
+
 # 系统
 Thumbs.db
 .DS_Store
