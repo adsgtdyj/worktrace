@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+# onefile 模式：打成单个 WorkTrace.exe，方便分发给小白（双击即用，无 _internal 目录）
 import os
 
 block_cipher = None
@@ -31,8 +32,10 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='WorkTrace',
     debug=False,
     bootloader_ignore_signals=False,
@@ -41,15 +44,4 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon=os.path.join(WORK_DIR, 'icons', 'worktrace.ico'),
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name='WorkTrace',
 )

@@ -55,6 +55,9 @@ else:
 DB_PATH = os.path.join(SCRIPT_DIR, "time_tracker.db")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
+# 版本号：与 GitHub 发版对齐，用户在设置面板底部可见，也写入启动日志
+VERSION = "0.1.0"
+
 # ========== DPI 缩放 ==========
 # 全局 UI 缩放系数。1.0 = 100%(96 DPI，界面像素值的设计基准)。
 # 混合 DPI 多屏下按窗口所在显示器的真实 DPI 计算，运行时可变。
@@ -182,6 +185,7 @@ if sys.platform == 'win32':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
     else:
         sys.stderr = sys.stdout
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] WorkTrace v{VERSION} 启动")
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -2248,6 +2252,10 @@ class SettingsWindow:
                              kind='normal').pack(side='left', padx=(_S(0), _S(8)))
         self._make_metal_btn(right_box, "保存", self._save,
                              kind='primary').pack(side='left')
+
+        # 版本号（右下角，灰色小字）
+        tk.Label(bd, text=f"WorkTrace v{VERSION}", font=('Microsoft YaHei', 8),
+                 bg=t["cream"], fg=t["muted"], anchor='e').pack(fill='x', padx=_S(12), pady=(_S(4), _S(8)))
 
         # 拖拽 — 仅标题栏
         _bind_title_drag(self.win, hdr)
