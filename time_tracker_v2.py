@@ -204,7 +204,7 @@ DEFAULT_CONFIG = {
     "auto_start_new_day": False,   # 跨日后检测到操作时自动进入工作态（不弹任务选择）
     "window_x": -1,                 # 窗口位置 X（-1 表示自动）
     "window_y": -1,                 # 窗口位置 Y
-    "edge_hide": False,             # 吸边隐藏：拖到屏幕左右边缘自动隐藏成露出条，移到露出条唤出
+    "edge_hide": True,              # 吸边隐藏：拖到屏幕左右边缘自动隐藏成露出条，移到露出条唤出（默认开启）
     "theme": "dark",                # 主题：dark / light
     # AI 内容感知偏离判定
     "ai_enabled": True,             # 是否启用 AI 内容判定（关闭则退回进程名兜底）
@@ -5946,6 +5946,14 @@ def _prompt_invite_code(parent, tracker, on_done=None):
             return
         result["done"] = True
         result["no_ai"] = no_ai
+        if no_ai:
+            # 关闭弹窗（×/Esc/不用 AI）＝ 不用 AI：同步关闭 AI 判定与正文外发，且不再于下次启动时打扰
+            config["ai_enabled"] = False
+            config["body_send"] = False
+            config["invite_prompted"] = True
+            save_config(config)
+            tracker.ai_enabled = False
+            tracker.body_send = False
         try:
             win.destroy()
         except Exception:
@@ -6013,12 +6021,6 @@ def _prompt_invite_code(parent, tracker, on_done=None):
     skip_btn.bind('<Leave>', lambda e, b=skip_btn: b.config(bg=t["white"], fg=t["black"]))
 
     def _close_no_ai():
-        config["ai_enabled"] = False
-        config["body_send"] = False
-        config["invite_prompted"] = True
-        save_config(config)
-        tracker.ai_enabled = False
-        tracker.body_send = False
         _close(True)
 
     ok_btn = tk.Label(right, text="确定", font=('Microsoft YaHei', 9, 'bold'),
