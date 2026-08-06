@@ -3854,6 +3854,19 @@ class TaskManagerWindow:
         self.new_entry.insert(0, "输入新任务名")
         self._refresh_list()
 
+        # 新建任务后自动让用户选中：唯一任务直接开始，多任务弹出选择。
+        # 否则任务列表卡片没有点击选中，新任务会一直停在"未选中"状态。
+        tk_ = self.tracker
+        if not tk_.current_task:
+            if len(tk_.today_tasks) == 1:
+                tk_.current_task = tk_.today_tasks[0]
+                window_info = WindowTracker.get_active_window_info()
+                tk_._start_activity(tk_.current_task, window_info)
+                print(f"[自动开始] {tk_.current_task.name}")
+                self._refresh_list()
+            else:
+                self.root.after(120, tk_._prompt_select_task)
+
     def _fmt_duration(self, seconds: int) -> str:
         h = seconds // 3600
         m = (seconds % 3600) // 60
