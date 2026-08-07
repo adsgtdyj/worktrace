@@ -3549,9 +3549,10 @@ class TaskManagerWindow:
 
         pomo_count = duration // max(1, config.get("pomodoro_minutes", 30) * 60)
         meta = "尚未开始" if duration <= 0 else f"{self._fmt_duration(duration)} · {pomo_count} 轮专注"
-        tk.Label(info, text=meta,
+        meta_lbl = tk.Label(info, text=meta,
                  font=('Microsoft YaHei', 8, 'bold'),
-                 bg=card_bg, fg=t["muted"], anchor='w').pack(fill='x', pady=(_S(3), _S(0)))
+                 bg=card_bg, fg=t["muted"], anchor='w')
+        meta_lbl.pack(fill='x', pady=(_S(3), _S(0)))
 
         if is_current:
             tk.Label(row, text="ACTIVE",
@@ -3578,7 +3579,11 @@ class TaskManagerWindow:
         del_btn.pack(side='left')
         del_btn.bind('<Button-1>', lambda e, tsk=task: self._delete_task(tsk))
 
-        for widget in (shadow, card, row, stripe, info, name_lbl, actions, kw_btn, edit_btn, del_btn):
+        # 卡片主体点击 = 选中该任务；按钮区（词/改/删）保留各自动作，不触发选中
+        for widget in (shadow, card, row, stripe, info, name_lbl, meta_lbl):
+            widget.bind('<Button-1>', lambda e, tsk=task: self._select_task(tsk))
+            widget.bind('<MouseWheel>', self._on_task_list_mousewheel, add='+')
+        for widget in (actions, kw_btn, edit_btn, del_btn):
             widget.bind('<MouseWheel>', self._on_task_list_mousewheel, add='+')
 
     def _make_action_btn(self, parent, text, fg):
@@ -3866,6 +3871,19 @@ class TaskManagerWindow:
                 self._refresh_list()
             else:
                 self.root.after(120, tk_._prompt_select_task)
+
+    def _select_task(self, task):
+        """点击任务卡片：选中并开始该任务。已是当前任务则忽略。"""
+        tk_ = self.tracker
+        if tk_.current_task and tk_.current_task.id == task.id:
+            return
+        if tk_.current_activity:
+            tk_._end_activity()
+        tk_.current_task = task
+        window_info = WindowTracker.get_active_window_info()
+        tk_._start_activity(task, window_info)
+        print(f"[选中任务] {task.name}")
+        self._refresh_list()
 
     def _fmt_duration(self, seconds: int) -> str:
         h = seconds // 3600
