@@ -3870,7 +3870,7 @@ class TaskManagerWindow:
                 print(f"[自动开始] {tk_.current_task.name}")
                 self._refresh_list()
             else:
-                self.root.after(120, tk_._prompt_select_task)
+                self.win.after(120, tk_._prompt_select_task)
 
     def _select_task(self, task):
         """点击任务卡片：选中并开始该任务。已是当前任务则忽略。"""
@@ -4846,13 +4846,14 @@ class TimeTracker:
 
         def _do():
             try:
+                selected_name = None
                 while True:
                     existing = [task.name for task in self.today_tasks]
                     task_ids = [task.id for task in self.today_tasks]
                     dialog = ModernDialog(
                         self.panel.root,
                         "今日任务规划",
-                        "早上好！请规划今天的任务：\n在下方输入任务名称，按回车或点击添加。\n可以多次添加，添加完关闭即可。",
+                        "早上好！请规划今天的任务：\n在下方输入任务名称，按回车或点击添加。\n可以多次添加，双击任务即开始。",
                         existing,
                         task_ids=task_ids,
                         on_task_edit=self._on_task_edit,
@@ -4880,13 +4881,21 @@ class TimeTracker:
                             self.db.save_task(task)
                             self.today_tasks.append(task)
                             print(f"[新任务已保存] {task_name}")
-                    elif result in existing:
-                        pass
-                    else:
-                        break
+                        continue
 
-                # 规划完成后：单任务自动开始，多任务弹出选择
-                if len(self.today_tasks) == 1 and not self.current_task:
+                    # 双击已有任务 = 选定它，退出规划循环并开始
+                    selected_name = result
+                    break
+
+                if selected_name:
+                    for task in self.today_tasks:
+                        if task.name == selected_name:
+                            self.current_task = task
+                            self._start_activity(task, WindowTracker.get_active_window_info())
+                            print(f"[开始任务] {task.name}")
+                            break
+                # 未选定时：单任务自动开始，多任务弹出选择
+                elif len(self.today_tasks) == 1 and not self.current_task:
                     self.current_task = self.today_tasks[0]
                     window_info = WindowTracker.get_active_window_info()
                     self._start_activity(self.current_task, window_info)
