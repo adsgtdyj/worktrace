@@ -5681,18 +5681,23 @@ function renderCalendar(viewDate) {{
   }}
   html += '</div>';
   popup.innerHTML = html;
-  document.getElementById('cal-prev').onclick = function() {{
+  // 注意：renderCalendar 会重写 popup.innerHTML，被点按钮随即脱离 DOM，
+  // 若继续冒泡到 document，那边的 popup.contains(e.target) 会误判成"点了外部"而关闭日历
+  document.getElementById('cal-prev').onclick = function(e) {{
+    e.stopPropagation();
     const nm = calViewMonth === 1 ? 12 : calViewMonth - 1;
     const ny = calViewMonth === 1 ? calViewYear - 1 : calViewYear;
     renderCalendar(fmtDate(ny, nm, 1));
   }};
-  document.getElementById('cal-next').onclick = function() {{
+  document.getElementById('cal-next').onclick = function(e) {{
+    e.stopPropagation();
     const nm = calViewMonth === 12 ? 1 : calViewMonth + 1;
     const ny = calViewMonth === 12 ? calViewYear + 1 : calViewYear;
     renderCalendar(fmtDate(ny, nm, 1));
   }};
   Array.prototype.forEach.call(popup.querySelectorAll('.cal-cell[data-date]'), function(el) {{
-    el.onclick = function() {{
+    el.onclick = function(e) {{
+      e.stopPropagation();
       const ds = el.getAttribute('data-date');
       render(ds);
       closeCalendar();
