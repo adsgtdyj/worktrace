@@ -7,6 +7,7 @@ daily_report.txt
 
 # 自动生成的复盘报告
 worktrace_review_*.html
+worktrace_review.html
 dashboard.html
 
 # 本地配置（含窗口位置等本地状态，按需提交）
