@@ -17,6 +17,13 @@ _new_panel.py
 _windows_new.py
 design_compare.html
 design_compare_d.html
+_capture_*.py
+_mock_*.py
+
+# 开发期截图与视觉对比产物
+memphis_*.png
+timer_variant_*.png
+timer_redesign_*.png
 
 # Python 缓存
 __pycache__/
