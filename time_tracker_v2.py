@@ -1014,6 +1014,7 @@ class ArkClient:
         self.model = cfg.get('ark_model', '')
         self._cache = {}       # key -> (ts, relation, reason)
         self._cache_ttl = 60   # 同一内容 60s 内不重复调用
+        self.fail_streak = 0   # 连续失败次数；成功即清零。主面板 AI 在线标识依据此值
 
     def available(self):
         return bool(self.api_key and self.endpoint and self.model)
@@ -1072,10 +1073,13 @@ class ArkClient:
             relation, reason = self._parse(content)
             if relation:
                 self._cache[key] = (now, relation, reason)
+                self.fail_streak = 0
                 return (relation, reason)
+            self.fail_streak += 1
             return None
         except Exception as e:
             print(f"[AI判定] 失败降级: {e}")
+            self.fail_streak += 1
             return None
 
     @staticmethod
@@ -4303,8 +4307,9 @@ class ControlPanel:
         c.create_rectangle(4, 224, self.WIDTH - 5, 226, fill=t["black"], outline='', tags='dynamic')
         c.create_rectangle(4, 227, self.WIDTH - 5, self.HEIGHT - 5, fill=t["cream"], outline='', tags='dynamic')
 
-        c.create_text(20, 23, text="W / TRACE", anchor='w', fill=t["black"],
-                      font=('JetBrains Mono', 14, 'bold'), tags='dynamic')
+        title_id = c.create_text(20, 23, text="W / TRACE", anchor='w', fill=t["black"],
+                                 font=('JetBrains Mono', 14, 'bold'), tags='dynamic')
+        self._draw_ai_stars(c, t, title_id)
         for x, color in ((298, t["black"]), (307, t["black"]), (316, t["red"])):
             c.create_rectangle(x, 20, x + 5, 25, fill=color, outline='', tags=('dynamic', 'menu_dots'))
         c.tag_bind('menu_dots', '<Enter>', lambda e: c.config(cursor='hand2'))
@@ -4371,6 +4376,31 @@ class ControlPanel:
                 c.create_rectangle(x + 2, y0 + 5, x + w - 2, y0 + h - 5,
                                    fill=t["cream"], outline='', tags='dynamic')
             x += w + gap
+
+    def _draw_ai_stars(self, c, t, title_id):
+        """AI 在线时在标题右侧绘制孟菲斯双星标识（主星 cream + 伴星 yellow）。
+        在线定义：ai_enabled 开启且邀请码/地址/模型齐备且最近一次判定未失败。
+        离线、调用失败、用户关闭 AI 一律不画，不解释原因。"""
+        ark = getattr(self.tracker, 'ark', None)
+        if ark is None or not getattr(self.tracker, 'ai_enabled', False):
+            return
+        if not ark.available() or ark.fail_streak > 0:
+            return
+        bbox = c.bbox(title_id)
+        if not bbox:
+            return
+        # bbox 返回的是缩放后的设备坐标，_create 会再乘 _SCALE，此处先除回去避免双缩放
+        tx2 = bbox[2] / _SCALE
+
+        def star(cx, cy, r, fill):
+            w = r * 0.30
+            c.create_polygon(
+                cx, cy - r, cx + w, cy - w, cx + r, cy, cx + w, cy + w,
+                cx, cy + r, cx - w, cy + w, cx - r, cy, cx - w, cy - w,
+                fill=fill, outline=t["black"], width=1, tags='dynamic')
+
+        star(tx2 + 9, 23, 8, t["cream"])
+        star(tx2 + 21, 14, 4, t["yellow"])
 
     def _memphis_status_text(self):
         t = self.theme()
