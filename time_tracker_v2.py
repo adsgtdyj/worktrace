@@ -210,7 +210,7 @@ DEFAULT_CONFIG = {
     "ai_enabled": True,             # 是否启用 AI 内容判定（关闭则退回进程名兜底）
     "body_send": True,              # 是否把正文摘要外发给 AI（关闭则只发标题+网址）
     "ark_api_key": "",              # 邀请码（中转服务鉴权用）-- 留空，真实邀请码写入本地 config.json
-    "ark_endpoint": "https://19f87c49.r17.cpolar.top/api/v3/chat/completions",  # AI 中转站公网地址
+    "ark_endpoint": "http://127.0.0.1:8000/api/v3/chat/completions",  # AI 中转站地址（公网地址会变，本机用 localhost 最稳）
     "ark_model": "deepseek-v4-flash",  # 占位用：中转站设置 model_override 后此字段会被服务端覆盖
     "invite_prompted": False       # 是否已弹过首次邀请码引导（只弹一次，之后用户去设置里改）
 }
@@ -2236,6 +2236,20 @@ class SettingsWindow:
                         "中转服务的 HTTP 地址。默认 http://localhost:8000/api/v3/chat/completions。"
                         "运营者换公网穿透地址时改这里，无需重新打包 exe。")
 
+        # ---- 测试连接行（不依赖保存，直接读输入框值） ----
+        t_local = self.theme()
+        test_row = tk.Frame(content, bg=t_local["white"])
+        test_row.pack(fill='x', pady=(_S(2), _S(8)))
+        self._test_btn = tk.Button(
+            test_row, text="测试连接", font=('Microsoft YaHei', 9, 'bold'),
+            bg=t_local["yellow"], fg=t_local["black"], activebackground=t_local["teal"],
+            relief='flat', bd=0, highlightthickness=2, highlightbackground=t_local["black"],
+            padx=_S(12), pady=_S(2), cursor='hand2', command=self._on_test_click)
+        self._test_btn.pack(side='left')
+        self._test_lbl = tk.Label(test_row, text="", font=('Microsoft YaHei', 8, 'bold'),
+                                 bg=t_local["white"], anchor='w')
+        self._test_lbl.pack(side='left', padx=(_S(8), 0), fill='x', expand=True)
+
         tk.Frame(bd, bg=t["black"], height=4).pack(fill='x', pady=(_S(8), _S(0)))
 
         btn_row = tk.Frame(bd, bg=t["cream"])
@@ -2441,6 +2455,43 @@ class SettingsWindow:
         self._vars[key] = var
         self._entries[key] = entry
         return entry
+
+    def _on_test_click(self):
+        """点击'测试连接'：禁用按钮、在后台线程发最小调用，结果回写标签。"""
+        self._test_btn.configure(state='disabled', text='测试中…')
+        t = self.theme()
+        self._test_lbl.configure(text='正在调用中转服务…', fg=t["black"])
+        thread = threading.Thread(target=self._run_test, daemon=True)
+        thread.start()
+
+    def _run_test(self):
+        """后台线程：基于当前输入框（未保存也可）构建 ArkClient 实呼一次，结果通过 after 写回。"""
+        try:
+            cfg = {
+                'ark_api_key': self._vars['ark_api_key'].get().strip(),
+                'ark_endpoint': self._vars['ark_endpoint'].get().strip(),
+                'ark_model': self._vars.get('ark_model').get().strip() if 'ark_model' in self._vars else self.cfg.get('ark_model', ''),
+            }
+            from time_tracker_v2 import ArkClient  # 同进程内引用
+            client = ArkClient(cfg)
+            if not client.available():
+                raise RuntimeError('邀请码/中转地址/模型至少有一项为空')
+            t0 = time.time()
+            res = client.classify('测试任务', '', 'test', '连通性测试', '', '请只输出 {"relation":"related","reason":"ok"}')
+            elapsed = time.time() - t0
+            if res is None:
+                raise RuntimeError('调用失败（无响应或解析失败，看 worktrace_start.log）')
+            relation, reason = res
+            t = self.theme()
+            msg = f"通过 ({elapsed:.1f}s) · {relation} · {reason[:30]}"
+            self.win.after(0, lambda: self._show_test_result(True, msg, t["teal"]))
+        except Exception as e:
+            t = self.theme()
+            self.win.after(0, lambda err=str(e): self._show_test_result(False, err, t["red"]))
+
+    def _show_test_result(self, ok, text, color):
+        self._test_lbl.configure(text=('✓ ' if ok else '✗ ') + text, fg=color)
+        self._test_btn.configure(state='normal', text='测试连接')
 
     def _make_metal_btn(self, parent, text, on_click, kind='normal'):
         t = self.theme()
