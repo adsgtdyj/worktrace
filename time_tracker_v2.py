@@ -1008,10 +1008,24 @@ class ArkClient:
     """火山方舟偏离判定客户端。给定任务与当前内容，返回 (relation, reason)。
     relation ∈ related|maybe_drift|drift；任何失败/超时都返回 None 交由上层降级。"""
 
+    @staticmethod
+    def _normalize_endpoint(ep):
+        """清洗中转地址：容忍粘贴进来的换行/空格/裸域名。
+        - 去首尾空白；- 缺协议默认 https://；- 缺路径自动补 /api/v3/chat/completions。"""
+        ep = (ep or '').strip()
+        if not ep:
+            return ''
+        if not ep.startswith(('http://', 'https://')):
+            ep = 'https://' + ep
+        ep = ep.rstrip('/')
+        if not ep.endswith('/chat/completions'):
+            ep += '/api/v3/chat/completions'
+        return ep
+
     def __init__(self, cfg):
-        self.api_key = cfg.get('ark_api_key', '')
-        self.endpoint = cfg.get('ark_endpoint', '')
-        self.model = cfg.get('ark_model', '')
+        self.api_key = cfg.get('ark_api_key', '').strip()
+        self.endpoint = self._normalize_endpoint(cfg.get('ark_endpoint', ''))
+        self.model = cfg.get('ark_model', '').strip()
         self._cache = {}       # key -> (ts, relation, reason)
         self._cache_ttl = 60   # 同一内容 60s 内不重复调用
         self.fail_streak = 0   # 连续失败次数；成功即清零。主面板 AI 在线标识依据此值
