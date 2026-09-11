@@ -1386,11 +1386,14 @@ def _bind_full_drag(win, *widgets, on_snap_save=None):
     win.bind('<ButtonRelease-1>', _end, add='+')
 
 
-def _bind_title_drag(win, *widgets, on_snap_save=None):
+def _bind_title_drag(win, *widgets, on_snap_save=None, on_dpi_rebuild=None):
     """仅让指定的标题栏 widget（及其子树）可拖动窗口，内容区不参与拖拽。
     跳过按钮（cursor='hand2'）和输入框。用于设置/统计/任务列表等含交互控件的面板，
-    避免拖动滑块/内容时误拖窗口。全局统一：面板一律标题栏拖拽。"""
+    避免拖动滑块/内容时误拖窗口。全局统一：面板一律标题栏拖拽。
+    on_dpi_rebuild(new_scale)：松手时检测到跨屏 DPI 变化（差>0.15）则回调，
+    用于子窗口销毁重建（SettingsWindow/StatsWindow/TaskManagerWindow）。"""
     SNAP = _S(20)
+    _build_scale = _SCALE  # 绑定（即窗口构建）时的缩放系数基准
 
     def _start(e):
         w = e.widget
@@ -1435,6 +1438,15 @@ def _bind_title_drag(win, *widgets, on_snap_save=None):
             delattr(win, '_drag_y')
         if on_snap_save:
             on_snap_save()
+        # 跨屏 DPI 检测：拖到了缩放比不同的屏上，回调让窗口销毁重建
+        if on_dpi_rebuild:
+            try:
+                _ns = _dpi_scale_for_point(win.winfo_rootx() + 20,
+                                           win.winfo_rooty() + 20)
+                if abs(_ns - _build_scale) > 0.15:
+                    win.after(80, lambda ns=_ns: on_dpi_rebuild(ns))
+            except Exception:
+                pass
 
     def _bind_tree(widget):
         _start_ok = True
@@ -1452,6 +1464,36 @@ def _bind_title_drag(win, *widgets, on_snap_save=None):
 
     for w in widgets:
         _bind_tree(w)
+
+
+def _rebuild_subwindow_on_dpi(win, new_scale, make_new):
+    """子窗口跨屏 DPI 重建：销毁旧窗，临时把全局 _SCALE 切到目标屏系数构建新窗，
+    构建完成后恢复主窗系数（主窗每秒全量重绘依赖全局 _SCALE）。
+    make_new() 返回新窗口对象（需含 .win 属性）。返回新窗口。
+    已知残留：tk 字体点号缩放跟随主窗所在屏，跨屏后字体大小可能略不匹配——
+    全局 _SCALE 方案的天然缺陷，本函数只修窗口几何。"""
+    global _SCALE
+    old = _SCALE
+    rx = ry = None
+    try:
+        rx, ry = win.winfo_rootx(), win.winfo_rooty()
+    except Exception:
+        pass
+    try:
+        win.destroy()
+    except Exception:
+        pass
+    _SCALE = new_scale if (new_scale and new_scale > 0) else 1.0
+    try:
+        w = make_new()
+        if rx is not None:
+            try:
+                w.win.geometry(f'+{rx}+{ry}')
+            except Exception:
+                pass
+        return w
+    finally:
+        _SCALE = old
 
 
 class CyberScrollbar(tk.Canvas):
@@ -2320,8 +2362,22 @@ class SettingsWindow:
         tk.Label(bd, text=f"WorkTrace v{VERSION}", font=('Microsoft YaHei', 8),
                  bg=t["cream"], fg=t["muted"], anchor='e').pack(fill='x', padx=_S(12), pady=(_S(4), _S(8)))
 
-        # 拖拽 — 仅标题栏
-        _bind_title_drag(self.win, hdr)
+        # 拖拽 — 仅标题栏；跨屏 DPI 变化时销毁重建（输入值先收集不丢失）
+        _bind_title_drag(self.win, hdr, on_dpi_rebuild=self._on_dpi_rebuild)
+
+    def _on_dpi_rebuild(self, new_scale):
+        """拖到不同缩放比的屏上：把未保存的输入/开关/滑块值收进 cfg，按新屏系数重建窗口。"""
+        for key, var in list(self._vars.items()):
+            try:
+                self.cfg[key] = var.get()
+            except Exception:
+                pass
+        parent, cfg, on_save = self.parent, self.cfg, self.on_save
+
+        def make_new():
+            return SettingsWindow(parent, cfg, on_save=on_save)
+
+        _rebuild_subwindow_on_dpi(self.win, new_scale, make_new)
 
     # ---------- 视觉组件 ----------
     def _make_plate(self, parent, text):
@@ -3042,7 +3098,17 @@ class StatsWindow:
         self.footer_lbl = None
 
         # 拖拽 — 仅标题栏
-        _bind_title_drag(self.win, titlebar)
+        _bind_title_drag(self.win, titlebar, on_dpi_rebuild=self._on_dpi_rebuild)
+
+    def _on_dpi_rebuild(self, new_scale):
+        """拖到不同缩放比的屏上：销毁并按新屏系数重建（数据实时从 db 读，无状态可丢）。"""
+        parent = self.win.master
+        db = self.db
+
+        def make_new():
+            return StatsWindow(parent, db)
+
+        _rebuild_subwindow_on_dpi(self.win, new_scale, make_new)
 
     def _fit_height(self):
         self.win.update_idletasks()
@@ -3563,7 +3629,17 @@ class TaskManagerWindow:
         self.new_entry.bind('<FocusIn>', self._on_new_entry_focus)
         self.new_entry.bind('<Return>', lambda e: self._add_task())
 
-        _bind_title_drag(self.win, hdr)
+        _bind_title_drag(self.win, hdr, on_dpi_rebuild=self._on_dpi_rebuild)
+
+    def _on_dpi_rebuild(self, new_scale):
+        """拖到不同缩放比的屏上：销毁并按新屏系数重建（数据实时从 db 读，无状态可丢）。"""
+        parent = self.win.master
+        db, tracker = self.db, self.tracker
+
+        def make_new():
+            return TaskManagerWindow(parent, db, tracker)
+
+        _rebuild_subwindow_on_dpi(self.win, new_scale, make_new)
 
     def _draw_scanline(self):
         c = self._scanline_canvas
