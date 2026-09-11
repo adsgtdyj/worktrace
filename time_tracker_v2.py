@@ -1028,10 +1028,41 @@ class ArkClient:
         self.model = cfg.get('ark_model', '').strip()
         self._cache = {}       # key -> (ts, relation, reason)
         self._cache_ttl = 60   # 同一内容 60s 内不重复调用
-        self.fail_streak = 0   # 连续失败次数；成功即清零。主面板 AI 在线标识依据此值
+        # 连续失败计数；成功即清零。初始 1 表示"未验证"——双星只在确认在线后亮。
+        # 启动/改配置时由 ping() 探活，判定周期内由 classify 成败更新。
+        self.fail_streak = 1
 
     def available(self):
         return bool(self.api_key and self.endpoint and self.model)
+
+    def ping(self):
+        """轻量探活：最小对话请求验证整条链路（邀请码/地址/模型/上游）。
+        成功 fail_streak=0（双星亮）；失败 +1（双星灭）。后台线程调用，GIL 下 int 赋值原子。"""
+        if not self.available():
+            return False
+        payload = {
+            'model': self.model,
+            'messages': [{'role': 'user', 'content': 'ping'}],
+            'max_tokens': 4,
+        }
+        try:
+            req = urllib.request.Request(
+                self.endpoint,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json',
+                         'X-Invite-Code': self.api_key},
+                method='POST')
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode('utf-8'))
+            if data.get('choices'):
+                self.fail_streak = 0
+                return True
+            self.fail_streak += 1
+            return False
+        except Exception as e:
+            print(f"[AI探活] 失败: {e}")
+            self.fail_streak += 1
+            return False
 
     def classify(self, task_name, keywords, app, title, url, body, description=''):
         if not self.available():
@@ -4658,6 +4689,7 @@ class ControlPanel:
         self.tracker.ai_enabled = config.get("ai_enabled", True)
         self.tracker.body_send = config.get("body_send", True)
         self.tracker.ark = ArkClient(config)
+        threading.Thread(target=self.tracker.ark.ping, daemon=True).start()  # 保存即探活
         if not config.get("edge_hide", False) and self._edge_state != 'free':
             self._enter_free()
         else:
@@ -4843,6 +4875,7 @@ class TimeTracker:
         self.ai_enabled = config.get("ai_enabled", True)
         self.body_send = config.get("body_send", True)
         self.ark = ArkClient(config)
+        threading.Thread(target=self.ark.ping, daemon=True).start()  # 启动即探活，双星只反映真实连通
         self._last_relation = 'related'        # 最近一次判定结果（供 UI/日志）
 
     def start(self):
@@ -6139,6 +6172,7 @@ def _prompt_invite_code(parent, tracker, on_done=None):
         config["invite_prompted"] = True
         save_config(config)
         tracker.ark = ArkClient(config)
+        threading.Thread(target=tracker.ark.ping, daemon=True).start()  # 录入邀请码即探活
         tracker.ai_enabled = True
         _close(False)
 
