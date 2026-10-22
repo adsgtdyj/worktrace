@@ -1466,6 +1466,85 @@ def _bind_title_drag(win, *widgets, on_snap_save=None, on_dpi_rebuild=None):
         _bind_tree(w)
 
 
+def _ime_pin_entry(entry, font_px=15):
+    """把 IME 组字窗/候选窗钉到 Entry 附近，并把组字字体放大到可读尺寸。
+    修复：高 DPI（PER_MONITOR_AWARE_V2）下系统 IME 浮窗不跟随应用缩放，
+    拼音组字串极小、候选窗在窗口底部被裁切。
+    通过 IMM API：CFS_POINT 钉组字起点到 Entry 左下角；CFS_EXCLUDE 把整个
+    Entry 设为排除区（候选窗弹到上方）；ImmSetCompositionFontW 放大组字字体。
+    失败一律静默（非 Windows/无 IMM/输入法不配合），绝不能影响输入本身。"""
+    try:
+        if sys.platform != 'win32':
+            return
+        user32 = ctypes.windll.user32
+        imm32 = ctypes.windll.imm32
+        user32.GetFocus.restype = ctypes.c_void_p
+        hwnd = user32.GetFocus()
+        if not hwnd:
+            return
+        himc = imm32.ImmGetContext(ctypes.c_void_p(hwnd))
+        if not himc:
+            return
+
+        class POINT(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+        class COMPOSITIONFORM(ctypes.Structure):
+            _fields_ = [('dwStyle', ctypes.c_uint),
+                        ('ptCurrentPos', POINT),
+                        ('rcArea', ctypes.wintypes.RECT)]
+
+        class CANDIDATEFORM(ctypes.Structure):
+            _fields_ = [('dwIndex', ctypes.c_uint),
+                        ('dwStyle', ctypes.c_uint),
+                        ('ptCurrentPos', POINT),
+                        ('rcArea', ctypes.wintypes.RECT)]
+
+        class LOGFONTW(ctypes.Structure):
+            _fields_ = [('lfHeight', ctypes.c_long), ('lfWidth', ctypes.c_long),
+                        ('lfEscapement', ctypes.c_long), ('lfOrientation', ctypes.c_long),
+                        ('lfWeight', ctypes.c_long), ('lfItalic', ctypes.c_byte),
+                        ('lfUnderline', ctypes.c_byte), ('lfStrikeOut', ctypes.c_byte),
+                        ('lfCharSet', ctypes.c_byte), ('lfOutPrecision', ctypes.c_byte),
+                        ('lfClipPrecision', ctypes.c_byte), ('lfQuality', ctypes.c_byte),
+                        ('lfPitchAndFamily', ctypes.c_byte),
+                        ('lfFaceName', ctypes.c_wchar * 32)]
+
+        def to_client(sx, sy):
+            pt = POINT(int(sx), int(sy))
+            user32.ScreenToClient(ctypes.c_void_p(hwnd), ctypes.byref(pt))
+            return pt
+
+        try:
+            ex, ey = entry.winfo_rootx(), entry.winfo_rooty()
+            ew, eh = entry.winfo_width(), entry.winfo_height()
+            # 组字窗：Entry 内左下角（跟手写位置）
+            cf = COMPOSITIONFORM()
+            cf.dwStyle = 0x0002  # CFS_POINT
+            cf.ptCurrentPos = to_client(ex + 4, ey + eh - 3)
+            imm32.ImmSetCompositionWindow(ctypes.c_void_p(himc), ctypes.byref(cf))
+            # 候选窗排除区：整个 Entry 矩形 → 候选弹到输入框上方，不再被底边裁切
+            cdf = CANDIDATEFORM()
+            cdf.dwIndex = 0
+            cdf.dwStyle = 0x0080  # CFS_EXCLUDE
+            cdf.ptCurrentPos = to_client(ex, ey)
+            cdf.rcArea = ctypes.wintypes.RECT(to_client(ex, ey).x, to_client(ex, ey).y,
+                                              to_client(ex + ew, ey + eh).x,
+                                              to_client(ex + ew, ey + eh).y)
+            imm32.ImmSetCandidateWindow(ctypes.c_void_p(himc), ctypes.byref(cdf))
+            # 组字字体：跟随当前屏缩放，用正文字体
+            lf = LOGFONTW()
+            lf.lfHeight = -int(font_px * _SCALE)
+            lf.lfWeight = 700
+            lf.lfCharSet = 0  # DEFAULT_CHARSET
+            lf.lfFaceName = 'Microsoft YaHei'
+            imm32.ImmSetCompositionFontW(ctypes.c_void_p(himc), ctypes.byref(lf))
+        finally:
+            imm32.ImmReleaseContext(ctypes.c_void_p(hwnd), ctypes.c_void_p(himc))
+    except Exception:
+        pass
+
+
 def _rebuild_subwindow_on_dpi(win, new_scale, make_new):
     """子窗口跨屏 DPI 重建：销毁旧窗，临时把全局 _SCALE 切到目标屏系数构建新窗，
     构建完成后恢复主窗系数（主窗每秒全量重绘依赖全局 _SCALE）。
@@ -3622,11 +3701,12 @@ class TaskManagerWindow:
                  bg=t["cream"], fg=t["red"]).pack(side='left')
 
         self.new_entry = tk.Entry(add_row, font=('Microsoft YaHei', 10, 'bold'),
-                                  bg=t["cream"], fg=t["black"],
+                                  bg=t["cream"], fg=t["muted"],
                                   insertbackground=t["teal"], relief='flat', bd=0)
         self.new_entry.pack(side='left', fill='x', expand=True, padx=(_S(7), _S(0)))
         self.new_entry.insert(0, "输入新任务名")
         self.new_entry.bind('<FocusIn>', self._on_new_entry_focus)
+        self.new_entry.bind('<FocusOut>', self._on_new_entry_blur)
         self.new_entry.bind('<Return>', lambda e: self._add_task())
 
         _bind_title_drag(self.win, hdr, on_dpi_rebuild=self._on_dpi_rebuild)
@@ -3663,8 +3743,17 @@ class TaskManagerWindow:
         return 'break'
 
     def _on_new_entry_focus(self, event=None):
+        """聚焦：占位文字清空、文字转黑；同时把 IME 浮窗钉到输入框附近并放大组字字体。"""
         if self.new_entry.get() == "输入新任务名":
             self.new_entry.delete(0, 'end')
+        self.new_entry.configure(fg=theme()["black"])
+        _ime_pin_entry(self.new_entry)
+
+    def _on_new_entry_blur(self, event=None):
+        """失焦：为空则补回占位文字（灰色），不再依赖 FocusIn 单次触发。"""
+        if not self.new_entry.get():
+            self.new_entry.insert(0, "输入新任务名")
+            self.new_entry.configure(fg=theme()["muted"])
 
     def _refresh_list(self):
         t = theme()
@@ -4031,8 +4120,9 @@ class TaskManagerWindow:
         self.db.save_task(task)
         self.tracker.today_tasks.append(task)
 
+        # 只清空，不插回占位文字：焦点仍在输入框内，FocusIn 不会再触发；
+        # 占位文字由 FocusOut（点别处后）自动补回，避免"输入新任务名方法"式拼接
         self.new_entry.delete(0, 'end')
-        self.new_entry.insert(0, "输入新任务名")
         self._refresh_list()
 
         # 新建任务后自动让用户选中：唯一任务直接开始，多任务弹出选择。
