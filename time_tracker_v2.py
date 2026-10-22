@@ -210,7 +210,7 @@ DEFAULT_CONFIG = {
     "ai_enabled": True,             # 是否启用 AI 内容判定（关闭则退回进程名兜底）
     "body_send": True,              # 是否把正文摘要外发给 AI（关闭则只发标题+网址）
     "ark_api_key": "",              # 邀请码（中转服务鉴权用）-- 留空，真实邀请码写入本地 config.json
-    "ark_endpoint": "http://127.0.0.1:8000/api/v3/chat/completions",  # AI 中转站地址（公网地址会变，本机用 localhost 最稳）
+    "ark_endpoint": "http://59.110.48.67:8200/api/v3/chat/completions",  # AI 中转站地址（自有服务器，固定 IP）
     "ark_model": "deepseek-v4-flash",  # 占位用：中转站设置 model_override 后此字段会被服务端覆盖
     "invite_prompted": False       # 是否已弹过首次邀请码引导（只弹一次，之后用户去设置里改）
 }
